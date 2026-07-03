@@ -31,9 +31,9 @@
 
 #define FRAME_WIDTH 1280
 #define FRAME_HEIGHT 720
-#define BOX_SIZE 64
+#define BOX_SIZE 128
 #define BG_COLOR 0x0010  // Dark blue (RGB565)
-#define BOX_COLOR 0xFFE0 // Yellow (RGB565)
+#define BOX_COLOR 0x0000 // Black Hole of Death (RGB565)
 
 // Audio configuration
 #define AUDIO_SAMPLE_RATE 48000
@@ -120,6 +120,7 @@ static void generate_audio(void)
 // ============================================================================
 
 static uint16_t rainbow_palette[256];
+static uint32_t rainbow_palette32[256];
 
 static inline uint16_t hue_to_rgb565(uint8_t hue)
 {
@@ -144,6 +145,9 @@ static void init_rainbow_palette(void)
     for (int i = 0; i < 256; i++) {
         rainbow_palette[i] = hue_to_rgb565((uint8_t)i);
     }
+    for (int i = 0; i < 256; i++) {
+        rainbow_palette32[i] = (uint32_t)rainbow_palette[i] | ((uint32_t)rainbow_palette[(uint8_t)(i + 1)] << 16);
+    }
 }
 
 static void __scratch_x("") scanline_callback(uint32_t v_scanline, uint32_t active_line, uint32_t *dst)
@@ -154,12 +158,45 @@ static void __scratch_x("") scanline_callback(uint32_t v_scanline, uint32_t acti
 
     uint8_t color_idx = (uint8_t)(box_x + box_y + fb_line);
 
-    for (int i = 0; i < FRAME_WIDTH / 2; i++) {
-        uint32_t packed = (uint32_t)rainbow_palette[color_idx];
-        uint32_t next = (uint32_t)rainbow_palette[(uint8_t)(color_idx + 1)];
-        dst[i] = packed | (next << 16);
-        color_idx += 2;
+    // Read current box position
+    int bx = box_x;
+    int by = box_y;
+
+    uint32_t box = BOX_COLOR | (BOX_COLOR << 16);
+
+    // Check if this line intersects the box vertically
+    if (fb_line >= by && fb_line < by + BOX_SIZE) {
+        // Three regions: before box, box, after box
+        int i = 0;
+        int box_start = bx / 2;
+        int box_end = (bx + BOX_SIZE) / 2;
+
+        // Region 1: before box
+        for (; i < box_start; i++) {
+            dst[i] = rainbow_palette32[color_idx];
+            color_idx += 2;
+        }
+
+        // Region 2: box
+        for (; i < box_end && i < FRAME_WIDTH / 2; i++) {
+            dst[i] = box;
+            color_idx += 2;
+        }
+
+        // Region 3: after box
+        for (; i < FRAME_WIDTH / 2; i++) {
+            dst[i] = rainbow_palette32[color_idx];
+            color_idx += 2;
+        }
+    } else {
+        // Fast path: entire line is background
+        for (int i = 0; i < FRAME_WIDTH / 2; i++) {
+            dst[i] = rainbow_palette32[color_idx];
+            color_idx += 2;
+        }
     }
+
+    
 }
 
 // ============================================================================
