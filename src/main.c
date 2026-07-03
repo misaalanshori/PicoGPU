@@ -119,44 +119,46 @@ static void generate_audio(void)
 // Scanline Callback (runs on Core 1)
 // ============================================================================
 
+static uint16_t rainbow_palette[256];
+
+static inline uint16_t hue_to_rgb565(uint8_t hue)
+{
+    uint8_t region = hue / 43;
+    uint8_t remainder = (hue - region * 43) * 6;
+    uint8_t r = 0, g = 0, b = 0;
+
+    switch (region) {
+        case 0: r = 255; g = remainder; b = 0; break;         // Red -> Yellow
+        case 1: r = 255 - remainder; g = 255; b = 0; break;   // Yellow -> Green
+        case 2: r = 0; g = 255; b = remainder; break;         // Green -> Cyan
+        case 3: r = 0; g = 255 - remainder; b = 255; break;   // Cyan -> Blue
+        case 4: r = remainder; g = 0; b = 255; break;         // Blue -> Magenta
+        default: r = 255; g = 0; b = 255 - remainder; break; // Magenta -> Red
+    }
+
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+static void init_rainbow_palette(void)
+{
+    for (int i = 0; i < 256; i++) {
+        rainbow_palette[i] = hue_to_rgb565((uint8_t)i);
+    }
+}
+
 static void __scratch_x("") scanline_callback(uint32_t v_scanline, uint32_t active_line, uint32_t *dst)
 {
     (void)v_scanline;
 
     int fb_line = active_line;
 
-    // Read current box position
-    int bx = box_x;
-    int by = box_y;
+    uint8_t color_idx = (uint8_t)(box_x + box_y + fb_line);
 
-    uint32_t bg = BG_COLOR | (BG_COLOR << 16);
-    uint32_t box = BOX_COLOR | (BOX_COLOR << 16);
-
-    // Check if this line intersects the box vertically
-    if (fb_line >= by && fb_line < by + BOX_SIZE) {
-        // Three regions: before box, box, after box
-        int i = 0;
-
-        // Region 1: before box
-        // Note: iterating by 2 pixels at a time (1 uint32_t)
-        for (; i < bx / 2; i++) {
-            dst[i] = bg;
-        }
-
-        // Region 2: box
-        for (; i < (bx + BOX_SIZE) / 2 && i < FRAME_WIDTH / 2; i++) {
-            dst[i] = box;
-        }
-
-        // Region 3: after box
-        for (; i < FRAME_WIDTH / 2; i++) {
-            dst[i] = bg;
-        }
-    } else {
-        // Fast path: entire line is background
-        for (int i = 0; i < FRAME_WIDTH / 2; i++) {
-            dst[i] = bg;
-        }
+    for (int i = 0; i < FRAME_WIDTH / 2; i++) {
+        uint32_t packed = (uint32_t)rainbow_palette[color_idx];
+        uint32_t next = (uint32_t)rainbow_palette[(uint8_t)(color_idx + 1)];
+        dst[i] = packed | (next << 16);
+        color_idx += 2;
     }
 }
 
@@ -198,6 +200,7 @@ int main(void)
     sleep_ms(1000);
 
     init_sine_table();
+    init_rainbow_palette();
     note_frames_remaining = current_melody[0].duration;
     phase_increment = (uint32_t)(((uint64_t)current_melody[0].freq << 32) / AUDIO_SAMPLE_RATE);
 
