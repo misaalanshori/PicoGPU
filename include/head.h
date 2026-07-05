@@ -36,6 +36,8 @@ SPDX-License-Identifier: Unlicense
 
 #include <stdint.h>
 
+uint8_t rgb565_to_rgb332(uint16_t rgb565);
+
 static const uint8_t HEAD_WIDTH = 82;
 static const uint8_t HEAD_HEIGHT = 64;
 
