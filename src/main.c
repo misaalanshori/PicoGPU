@@ -25,26 +25,30 @@
 #include <string.h>
 
 #include "audio.h"
-// ============================================================================
-// Configuration
-// ============================================================================
 
-#define FRAME_WIDTH 1280
-#define FRAME_HEIGHT 720
-#define BOX_SIZE 128
-#define BG_COLOR 0x0010  // Dark blue (RGB565)
-#define BOX_COLOR 0x0000 // Black Hole of Death (RGB565)
+#include <malloc.h>
+#include <pico/stdlib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
+
+#include <sys/time.h>
+
+#include <aps.h>
+#include <font6x9.h>
+#include <fps.h>
+#include <hagl.h>
+#include <hagl_hal.h>
+
+#include "deform.h"
+#include "metaballs.h"
+#include "plasma.h"
+#include "rotozoom.h"
 
 // Audio configuration
 #define AUDIO_SAMPLE_RATE 48000
 #define TONE_AMPLITUDE 6000
-
-// ============================================================================
-// Animation State
-// ============================================================================
-
-static volatile int box_x = 50, box_y = 50;
-static int box_dx = 4, box_dy = 2;
 
 // ============================================================================
 // Audio State - Für Elise
@@ -62,6 +66,30 @@ static int current_melody_length = KOROBEINIKI_LENGTH;
 
 static int melody_index = 0;
 static int note_frames_remaining = 0;
+
+// From pico_effects
+static uint8_t effect = 1;
+volatile bool fps_flag = false;
+volatile bool switch_flag = true;
+static fps_instance_t fps;
+static aps_instance_t bps;
+
+// static uint8_t *buffer;
+// static hagl_backend_t backend;
+static hagl_backend_t *display;
+
+wchar_t message[32];
+
+static const uint64_t US_PER_FRAME_60_FPS = 1000000 / 60;
+static const uint64_t US_PER_FRAME_30_FPS = 1000000 / 30;
+static const uint64_t US_PER_FRAME_25_FPS = 1000000 / 25;
+
+static char demo[4][32] = {
+    "METABALLS",
+    "PLASMA",
+    "ROTOZOOM",
+    "DEFORM",
+};
 
 static void init_sine_table(void)
 {
@@ -98,6 +126,8 @@ static inline int16_t get_sine_sample(void)
 static void generate_audio(void)
 {
     // Keep the audio queue fed
+    // Change this to like 500 and DI_RING_BUFFER_SIZE to 512 so the audio just slows down and not lag horribly
+    // Or just disable audio tbh
     while (hstx_di_queue_get_level() < 200) {
         audio_sample_t samples[4];
         for (int i = 0; i < 4; i++) {
@@ -115,112 +145,103 @@ static void generate_audio(void)
     }
 }
 
-// ============================================================================
-// Scanline Callback (runs on Core 1)
-// ============================================================================
 
-static uint16_t rainbow_palette[256];
-static uint32_t rainbow_palette32[256];
+// From pico_effects
 
-static inline uint16_t hue_to_rgb565(uint8_t hue)
-{
-    uint8_t region = hue / 43;
-    uint8_t remainder = (hue - region * 43) * 6;
-    uint8_t r = 0, g = 0, b = 0;
+size_t total_heap() {
+    extern char __StackLimit, __bss_end__;
 
-    switch (region) {
-        case 0: r = 255; g = remainder; b = 0; break;         // Red -> Yellow
-        case 1: r = 255 - remainder; g = 255; b = 0; break;   // Yellow -> Green
-        case 2: r = 0; g = 255; b = remainder; break;         // Green -> Cyan
-        case 3: r = 0; g = 255 - remainder; b = 255; break;   // Cyan -> Blue
-        case 4: r = remainder; g = 0; b = 255; break;         // Blue -> Magenta
-        default: r = 255; g = 0; b = 255 - remainder; break; // Magenta -> Red
-    }
-
-    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+    return &__StackLimit - &__bss_end__;
 }
 
-static void init_rainbow_palette(void)
-{
-    for (int i = 0; i < 256; i++) {
-        rainbow_palette[i] = hue_to_rgb565((uint8_t)i);
-    }
-    for (int i = 0; i < 256; i++) {
-        rainbow_palette32[i] = (uint32_t)rainbow_palette[i] | ((uint32_t)rainbow_palette[(uint8_t)(i + 1)] << 16);
-    }
+size_t free_heap(void) {
+    struct mallinfo m = mallinfo();
+
+    return total_heap() - m.uordblks;
 }
 
-static void __scratch_x("") scanline_callback(uint32_t v_scanline, uint32_t active_line, uint32_t *dst)
-{
-    (void)v_scanline;
+bool switch_timer_callback(struct repeating_timer *t) {
+    switch_flag = true;
+    return true;
+}
 
-    int fb_line = active_line;
+bool show_timer_callback(struct repeating_timer *t) {
+    fps_flag = true;
+    return true;
+}
 
-    uint8_t color_idx = (uint8_t)(box_x + box_y + fb_line);
+void static inline switch_demo() {
+    switch_flag = false;
 
-    // Read current box position
-    int bx = box_x;
-    int by = box_y;
-
-    uint32_t box = BOX_COLOR | (BOX_COLOR << 16);
-
-    // Check if this line intersects the box vertically
-    if (fb_line >= by && fb_line < by + BOX_SIZE) {
-        // Three regions: before box, box, after box
-        int i = 0;
-        int box_start = bx / 2;
-        int box_end = (bx + BOX_SIZE) / 2;
-
-        // Region 1: before box
-        for (; i < box_start; i++) {
-            dst[i] = rainbow_palette32[color_idx];
-            color_idx += 2;
-        }
-
-        // Region 2: box
-        for (; i < box_end && i < FRAME_WIDTH / 2; i++) {
-            dst[i] = box;
-            color_idx += 2;
-        }
-
-        // Region 3: after box
-        for (; i < FRAME_WIDTH / 2; i++) {
-            dst[i] = rainbow_palette32[color_idx];
-            color_idx += 2;
-        }
-    } else {
-        // Fast path: entire line is background
-        for (int i = 0; i < FRAME_WIDTH / 2; i++) {
-            dst[i] = rainbow_palette32[color_idx];
-            color_idx += 2;
-        }
+    switch (effect) {
+        case 0:
+            //metaballs_close();
+            break;
+        case 1:
+            plasma_close();
+            break;
+        case 2:
+            //rotozoom_close();
+            break;
+        case 3:
+            deform_close();
+            break;
     }
 
-    
+    effect = (effect + 1) % 4;
+
+    switch (effect) {
+        case 0:
+            metaballs_init(display);
+            //printf("[main] Initialized metaballs, %d free heap \r\n", free_heap());
+            break;
+        case 1:
+            plasma_init(display);
+            //printf("[main] Initialized plasma, %d free heap \r\n", free_heap());
+            break;
+        case 2:
+            rotozoom_init(display);
+            //printf("[main] Initialized rotozoom, %d free heap \r\n", free_heap());
+            break;
+        case 3:
+            deform_init(display);
+            //printf("[main] Initialized deform, %d free heap \r\n", free_heap());
+            break;
+    }
+
+    fps_init(&fps);
+    aps_init(&bps);
+}
+
+void static inline show_fps() {
+    hagl_color_t green = hagl_color(display, 0, 255, 0);
+
+    fps_flag = 0;
+
+    /* Set clip window to full screen so we can display the messages. */
+    hagl_set_clip(display, 0, 0, display->width - 1, display->height - 1);
+
+    /* Print the message on top left corner. */
+    swprintf(message, sizeof(message), L"%s    ", demo[effect]);
+    hagl_put_text(display, message, 4, 4, green, font6x9);
+
+    /* Print the message on lower left corner. */
+    swprintf(message, sizeof(message), L"%.*f FPS  ", 0, fps.current);
+    hagl_put_text(display, message, 4, display->height - 14, green, font6x9);
+
+    /* Print the message on lower right corner. */
+    swprintf(message, sizeof(message), L"%.*f KBPS  ", 0, bps.current / 1024);
+    hagl_put_text(
+        display, message, display->width - 60, display->height - 14, green, font6x9
+    );
+
+    /* Set clip window back to smaller so effects do not mess the messages. */
+    hagl_set_clip(display, 0, 20, display->width - 1, display->height - 21);
 }
 
 // ============================================================================
 // Main (Core 0)
 // ============================================================================
-
-static void update_box(void)
-{
-    int x = box_x + box_dx;
-    int y = box_y + box_dy;
-
-    if (x <= 0 || x + BOX_SIZE >= FRAME_WIDTH) {
-        box_dx = -box_dx;
-        x = box_x + box_dx;
-    }
-    if (y <= 0 || y + BOX_SIZE >= FRAME_HEIGHT) {
-        box_dy = -box_dy;
-        y = box_y + box_dy;
-    }
-
-    box_x = x;
-    box_y = y;
-}
-
 int main(void)
 {
     // 720p60: 372 MHz at 1.3V. Closest achievable to 371.25 MHz with 12 MHz XOSC
@@ -234,27 +255,36 @@ int main(void)
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 
-    sleep_ms(1000);
+    sleep_ms(2500);
+
+    // From pico_effects
+    size_t bytes = 0;
+    struct repeating_timer switch_timer;
+    struct repeating_timer show_timer;
+
+    printf("[main] %d total heap \r\n", total_heap());
+    printf("[main] %d free heap \r\n", free_heap());
+
+    fps_init(&fps);
+
+    display = hagl_init();
+
+    hagl_clear(display);
+    hagl_set_clip(display, 0, 20, display->width - 1, display->height - 21);
+
+    /* Change demo every 10 seconds. */
+    add_repeating_timer_ms(5000, switch_timer_callback, NULL, &switch_timer);
+
+    /* Update displayed FPS counter every 250 ms. */
+    add_repeating_timer_ms(250, show_timer_callback, NULL, &show_timer);
+
 
     init_sine_table();
-    init_rainbow_palette();
     note_frames_remaining = current_melody[0].duration;
     phase_increment = (uint32_t)(((uint64_t)current_melody[0].freq << 32) / AUDIO_SAMPLE_RATE);
 
-    // Initialize HDMI output — rt variant
-    hstx_di_queue_init();
-    video_output_set_mode(&video_mode_720_p);
-    video_output_init(FRAME_WIDTH, FRAME_HEIGHT);
-
-    // Register scanline callback
-    video_output_set_scanline_callback(scanline_callback);
-
     // Pre-fill audio buffer
     generate_audio();
-
-    // Launch Core 1 for HSTX output
-    multicore_launch_core1(video_output_core1_run);
-    sleep_ms(100);
 
     // Main loop - animation + audio
     uint32_t last_frame = 0;
@@ -270,8 +300,53 @@ int main(void)
         }
         last_frame = video_frame_count;
 
-        // Update animation
-        update_box();
+        // from pico_effects
+        {
+            // uint64_t start = time_us_64();
+
+            switch (effect) {
+                case 0:
+                    metaballs_animate(display);
+                    metaballs_render(display);
+                    break;
+                case 1:
+                    plasma_animate(display);
+                    plasma_render(display);
+                    break;
+                case 2:
+                    rotozoom_animate();
+                    rotozoom_render(display);
+                    break;
+                case 3:
+                    deform_animate();
+                    deform_render(display);
+                    break;
+            }
+
+            /* Update the displayed fps if requested. */
+            show_fps();
+
+            /* Flush back buffer contents to display. NOP if single buffering. */
+            bytes = hagl_flush(display);
+
+            aps_update(&bps, bytes);
+            fps_update(&fps);
+
+            /* Print the message in console and switch to next demo. */
+            if (switch_flag) {
+                // printf(
+                //     "[main] %s at %d fps / %d kBps\r\n",
+                //     demo[effect],
+                //     (uint32_t)fps.current,
+                //     (uint32_t)(bps.current / 1024)
+                // );
+                switch_demo();
+            }
+
+            // /* Cap the demos to 60 fps. This is mostly to accommodate to smaller */
+            // /* screens where plasma will run too fast. */
+            // busy_wait_until(start + US_PER_FRAME_60_FPS);
+        }
 
         // Advance melody (one note step per frame)
         advance_melody();
@@ -281,6 +356,8 @@ int main(void)
             led_state = !led_state;
             gpio_put(PICO_DEFAULT_LED_PIN, led_state);
         }
+
+
     }
 
     return 0;
