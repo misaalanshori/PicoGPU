@@ -20,6 +20,8 @@
 
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
+#include "hardware/pll.h"
+#include "hardware/structs/qmi.h"
 
 #include <math.h>
 #include <string.h>
@@ -246,9 +248,45 @@ int main(void)
 {
     // 720p60: 372 MHz at 1.3V. Closest achievable to 371.25 MHz with 12 MHz XOSC
     // (0.2% high -> 74.4 MHz pixel clock, within HDMI tolerance for 720p60).
-    vreg_set_voltage(VREG_VOLTAGE_1_30);
-    sleep_ms(10);
-    set_sys_clock_khz(372000, true);
+    // vreg_set_voltage(VREG_VOLTAGE_1_30);
+    // sleep_ms(10);
+    // set_sys_clock_khz(372000, true);
+
+    vreg_disable_voltage_limit();
+    vreg_set_voltage(VREG_VOLTAGE_1_40);
+    sleep_ms(20);
+
+    qmi_hw->m[0].timing = (qmi_hw->m[0].timing & ~0xFF) | 4;
+
+    volatile uint32_t *flash_ptr = (volatile uint32_t *)0x10000000;
+    (void)*flash_ptr;
+
+    set_sys_clock_khz(432000, true);
+
+    clock_configure(
+        clk_usb,
+        0, // clk_usb does not have a primary glitchless multiplexer
+        CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+        432 * MHZ,
+        48 * MHZ);
+
+    clock_configure(
+        clk_adc,
+        0,
+        CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+        432 * MHZ,
+        48 * MHZ);
+
+    pll_init(pll_usb, 1, 1116 * MHZ, 3, 1);
+ 
+    clock_configure(
+        clk_hstx,
+        0,
+        CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+        372 * MHZ,
+        372 * MHZ);
+
+    sleep_ms(2500);
 
     stdio_init_all();
 
@@ -334,12 +372,12 @@ int main(void)
 
             /* Print the message in console and switch to next demo. */
             if (switch_flag) {
-                // printf(
-                //     "[main] %s at %d fps / %d kBps\r\n",
-                //     demo[effect],
-                //     (uint32_t)fps.current,
-                //     (uint32_t)(bps.current / 1024)
-                // );
+                printf(
+                    "[main] %s at %d fps / %d kBps\r\n",
+                    demo[effect],
+                    (uint32_t)fps.current,
+                    (uint32_t)(bps.current / 1024)
+                );
                 switch_demo();
             }
 
