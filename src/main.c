@@ -1,402 +1,146 @@
-/**
- * pico_hdmi Bouncing Box (rt) Example
- *
- * Same visuals as bouncing_box, but goes through the runtime-mode-switching
- * variant of the library (video_output_rt.c) at 1280x720 @ 60Hz (CEA VIC 4).
- *
- * The CMakeLists enables PICO_HDMI_RUNTIME_MODES and defines VIDEO_MODE_1280x720
- * on both the library and this executable.
- *
- * Target: RP2350 (Raspberry Pi Pico 2), overclocked to 372 MHz at 1.3V core.
- */
+// main.c — PicoGPU Coprocessor Firmware Entry Point (RP2350)
+// Spec §3, TIP §6.1: Hardware init sequence, Core 1 launch, ring buffer processing loop.
+// THIS FILE REPLACES the previous pico_hdmi demo (metaballs/plasma/etc).
 
-#include "pico_hdmi/hstx_data_island_queue.h"
-#include "pico_hdmi/hstx_packet.h"
-#include "pico_hdmi/video_output.h" // for DI_HSYNC_ACTIVE
-#include "pico_hdmi/video_output_rt.h"
+#include "feature_flags.h"
+#include "error_codes.h"
+#include "opcodes.h"
 
-#include "pico/multicore.h"
+#include "state/coprocessor_state.h"
+#include "hal/rp2350/display_rp2350.h"
+#include "transport/ring_buffer.h"
+#include "transport/spi_slave.h"
+#include "protocol/packets.h"
+#include "protocol/dispatch.h"
+
 #include "pico/stdlib.h"
-
-#include "hardware/clocks.h"
+#include "pico/multicore.h"
 #include "hardware/vreg.h"
-#include "hardware/pll.h"
-#include "hardware/structs/qmi.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "hardware/structs/busctrl.h"
 
-#include <math.h>
-#include <string.h>
+// =============================================================================
+// RESET pin interrupt handler
+// Triggered by active-LOW pulse on GP7 from host (spec §3.5)
+// =============================================================================
+static volatile bool g_reset_requested = false;
 
-#include "audio.h"
-
-#include <malloc.h>
-#include <pico/stdlib.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <wchar.h>
-
-#include <sys/time.h>
-
-#include <aps.h>
-#include <font6x9.h>
-#include <fps.h>
-#include <hagl.h>
-#include <hagl_hal.h>
-
-#include "deform.h"
-#include "metaballs.h"
-#include "plasma.h"
-#include "rotozoom.h"
-
-// Audio configuration
-#define AUDIO_SAMPLE_RATE 48000
-#define TONE_AMPLITUDE 6000
-
-// ============================================================================
-// Audio State - Für Elise
-// ============================================================================
-
-#define SINE_TABLE_SIZE 256
-static int16_t sine_table[SINE_TABLE_SIZE];
-static uint32_t audio_phase = 0;
-static uint32_t phase_increment = 0;
-static int audio_frame_counter = 0;
-
-// Use Korobeiniki for the demo (Für Elise kept for reference)
-
-static int current_melody_length = KOROBEINIKI_LENGTH;
-
-static int melody_index = 0;
-static int note_frames_remaining = 0;
-
-// From pico_effects
-static uint8_t effect = 1;
-volatile bool fps_flag = false;
-volatile bool switch_flag = true;
-static fps_instance_t fps;
-static aps_instance_t bps;
-
-// static uint8_t *buffer;
-// static hagl_backend_t backend;
-static hagl_backend_t *display;
-
-wchar_t message[32];
-
-static const uint64_t US_PER_FRAME_60_FPS = 1000000 / 60;
-static const uint64_t US_PER_FRAME_30_FPS = 1000000 / 30;
-static const uint64_t US_PER_FRAME_25_FPS = 1000000 / 25;
-
-static char demo[4][32] = {
-    "METABALLS",
-    "PLASMA",
-    "ROTOZOOM",
-    "DEFORM",
-};
-
-static void init_sine_table(void)
-{
-    for (int i = 0; i < SINE_TABLE_SIZE; i++) {
-        float angle = (float)i * 2.0F * 3.14159265F / SINE_TABLE_SIZE;
-        sine_table[i] = (int16_t)(sinf(angle) * TONE_AMPLITUDE);
+static void gpio_irq_handler(uint gpio, uint32_t events) {
+    if (gpio == PIN_RESET && (events & GPIO_IRQ_EDGE_FALL)) {
+        g_reset_requested = true;
     }
 }
 
-static void advance_melody(void)
-{
-    if (--note_frames_remaining <= 0) {
-        melody_index = (melody_index + 1) % current_melody_length;
-
-        note_frames_remaining = current_melody[melody_index].duration;
-        uint16_t freq = current_melody[melody_index].freq;
-        if (freq > 0) {
-            phase_increment = (uint32_t)(((uint64_t)freq << 32) / AUDIO_SAMPLE_RATE);
-        } else {
-            phase_increment = 0; // Rest
-        }
-    }
+// =============================================================================
+// Core 1 entry — runs pico_hdmi DMA ISR loop forever (never returns)
+// Must be launched AFTER display_rp2350_init().
+// =============================================================================
+static void core1_entry(void) {
+    display_rp2350_core1_entry();
 }
 
-static inline int16_t get_sine_sample(void)
-{
-    if (phase_increment == 0)
-        return 0; // Rest
-    int16_t s = sine_table[(audio_phase >> 24) & 0xFF];
-    audio_phase += phase_increment;
-    return s;
-}
+// =============================================================================
+// Hardware initialization (TIP §6.1)
+// Critical: order matters — voltage before frequency, DMA priority before DMA config.
+// =============================================================================
+static void hw_init_all(void) {
+    // ── Step 1: Set voltage BEFORE raising frequency (TIP §6.1) ─────────────
+#if CPU_SPEED_FAST
+    vreg_set_voltage(VREG_VOLTAGE_1_30);  // 384 MHz @ 1.30V (spec §4.1)
+#else
+    vreg_set_voltage(VREG_VOLTAGE_1_10);  // 240 MHz @ 1.10V (conservative)
+#endif
+    sleep_ms(5); // voltage settling time
 
-static void generate_audio(void)
-{
-    // Keep the audio queue fed
-    // Change this to like 500 and DI_RING_BUFFER_SIZE to 512 so the audio just slows down and not lag horribly
-    // Or just disable audio tbh
-    while (hstx_di_queue_get_level() < 200) {
-        audio_sample_t samples[4];
-        for (int i = 0; i < 4; i++) {
-            int16_t s = get_sine_sample();
-            samples[i].left = s;
-            samples[i].right = s;
-        }
+    // ── Step 2: Set system clock ─────────────────────────────────────────────
+#if CPU_SPEED_FAST
+    set_sys_clock_khz(384000, true);      // 384 MHz
+#else
+    set_sys_clock_khz(240000, true);      // 240 MHz
+#endif
 
-        hstx_packet_t packet;
-        audio_frame_counter = hstx_packet_set_audio_samples(&packet, samples, 4, audio_frame_counter);
+    // ── Step 3: Elevate DMA bus priority (spec §4.2, TIP §4.3 item 5) ───────
+    // MUST happen before any DMA channel is configured.
+    // Prevents HSTX DMA timing corruption under heavy Core 0 SRAM access.
+    busctrl_hw->priority = BUSCTRL_BUS_PRIORITY_DMA_W_BITS |
+                           BUSCTRL_BUS_PRIORITY_DMA_R_BITS;
 
-        hstx_data_island_t island;
-        hstx_encode_data_island(&island, &packet, false, DI_HSYNC_ACTIVE);
-        hstx_di_queue_push(&island);
-    }
-}
-
-
-// From pico_effects
-
-size_t total_heap() {
-    extern char __StackLimit, __bss_end__;
-
-    return &__StackLimit - &__bss_end__;
-}
-
-size_t free_heap(void) {
-    struct mallinfo m = mallinfo();
-
-    return total_heap() - m.uordblks;
-}
-
-bool switch_timer_callback(struct repeating_timer *t) {
-    switch_flag = true;
-    return true;
-}
-
-bool show_timer_callback(struct repeating_timer *t) {
-    fps_flag = true;
-    return true;
-}
-
-void static inline switch_demo() {
-    switch_flag = false;
-
-    switch (effect) {
-        case 0:
-            //metaballs_close();
-            break;
-        case 1:
-            plasma_close();
-            break;
-        case 2:
-            //rotozoom_close();
-            break;
-        case 3:
-            deform_close();
-            break;
-    }
-
-    effect = (effect + 1) % 4;
-
-    switch (effect) {
-        case 0:
-            metaballs_init(display);
-            //printf("[main] Initialized metaballs, %d free heap \r\n", free_heap());
-            break;
-        case 1:
-            plasma_init(display);
-            //printf("[main] Initialized plasma, %d free heap \r\n", free_heap());
-            break;
-        case 2:
-            rotozoom_init(display);
-            //printf("[main] Initialized rotozoom, %d free heap \r\n", free_heap());
-            break;
-        case 3:
-            deform_init(display);
-            //printf("[main] Initialized deform, %d free heap \r\n", free_heap());
-            break;
-    }
-
-    fps_init(&fps);
-    aps_init(&bps);
-}
-
-void static inline show_fps() {
-    hagl_color_t green = hagl_color(display, 0, 255, 0);
-
-    fps_flag = 0;
-
-    /* Set clip window to full screen so we can display the messages. */
-    hagl_set_clip(display, 0, 0, display->width - 1, display->height - 1);
-
-    /* Print the message on top left corner. */
-    swprintf(message, sizeof(message), L"%s    ", demo[effect]);
-    hagl_put_text(display, message, 4, 4, green, font6x9);
-
-    /* Print the message on lower left corner. */
-    swprintf(message, sizeof(message), L"%.*f FPS  ", 0, fps.current);
-    hagl_put_text(display, message, 4, display->height - 14, green, font6x9);
-
-    /* Print the message on lower right corner. */
-    swprintf(message, sizeof(message), L"%.*f KBPS  ", 0, bps.current / 1024);
-    hagl_put_text(
-        display, message, display->width - 60, display->height - 14, green, font6x9
-    );
-
-    /* Set clip window back to smaller so effects do not mess the messages. */
-    hagl_set_clip(display, 0, 20, display->width - 1, display->height - 21);
-}
-
-// ============================================================================
-// Main (Core 0)
-// ============================================================================
-int main(void)
-{
-    // 720p60: 372 MHz at 1.3V. Closest achievable to 371.25 MHz with 12 MHz XOSC
-    // (0.2% high -> 74.4 MHz pixel clock, within HDMI tolerance for 720p60).
-    // vreg_set_voltage(VREG_VOLTAGE_1_30);
-    // sleep_ms(10);
-    // set_sys_clock_khz(372000, true);
-
-    vreg_disable_voltage_limit();
-    vreg_set_voltage(VREG_VOLTAGE_1_40);
-    sleep_ms(20);
-
-    qmi_hw->m[0].timing = (qmi_hw->m[0].timing & ~0xFF) | 4;
-
-    volatile uint32_t *flash_ptr = (volatile uint32_t *)0x10000000;
-    (void)*flash_ptr;
-
-    set_sys_clock_khz(432000, true);
-
-    clock_configure(
-        clk_usb,
-        0, // clk_usb does not have a primary glitchless multiplexer
+    // ── Step 4: Redirect clk_usb from pll_sys (frees pll_usb for HSTX) ─────
+    // clk_usb = clk_sys / 8 = 384 / 8 = 48 MHz  (TIP §6.2)
+    clock_configure(clk_usb, 0,
         CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
-        432 * MHZ,
-        48 * MHZ);
+        384 * MHZ, 48 * MHZ);
 
-    clock_configure(
-        clk_adc,
-        0,
-        CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
-        432 * MHZ,
-        48 * MHZ);
+    // ── Step 5: Init pico_hdmi HAL (UNINITIALIZED — no DVI output yet) ──────
+    display_rp2350_init();
 
-    pll_init(pll_usb, 1, 1116 * MHZ, 3, 1);
- 
-    clock_configure(
-        clk_hstx,
-        0,
-        CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
-        372 * MHZ,
-        372 * MHZ);
+    // ── Step 6: Init SPI slave PIO + ring buffer ─────────────────────────────
+    rb_init();
+    spi_slave_init();
 
-    sleep_ms(2500);
+    // ── Step 7: Configure control pins ───────────────────────────────────────
+    // BUSY (GP5): output, LOW initially
+    gpio_init(PIN_BUSY);
+    gpio_set_dir(PIN_BUSY, GPIO_OUT);
+    gpio_put(PIN_BUSY, 0);
 
-    stdio_init_all();
+    // TE (GP6): output — managed by display HAL scanline callback
+    // (already configured by display_rp2350_init)
 
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    // RESET (GP7): input with pull-up, active LOW — triggers soft reset
+    gpio_init(PIN_RESET);
+    gpio_set_dir(PIN_RESET, GPIO_IN);
+    gpio_pull_up(PIN_RESET);
+    gpio_set_irq_enabled_with_callback(PIN_RESET, GPIO_IRQ_EDGE_FALL,
+                                       true, gpio_irq_handler);
 
-    sleep_ms(2500);
+    // ── Step 8: Init protocol layers ─────────────────────────────────────────
+    packets_init();
+    dispatch_init();
 
-    // From pico_effects
-    size_t bytes = 0;
-    struct repeating_timer switch_timer;
-    struct repeating_timer show_timer;
+    // ── Step 9: Init coprocessor state to UNINITIALIZED defaults ────────────
+    coprocessor_state_init();
+}
 
-    printf("[main] %d total heap \r\n", total_heap());
-    printf("[main] %d free heap \r\n", free_heap());
+// =============================================================================
+// Main — GPU coprocessor firmware entry point
+// =============================================================================
+int main(void) {
+    // Initialize all hardware in the correct sequence
+    hw_init_all();
 
-    fps_init(&fps);
+    // Launch Core 1 — runs pico_hdmi polling loop + DMA ISR handler
+    // Core 1 is launched last, after all HW is configured (spec §5.1)
+    multicore_launch_core1(core1_entry);
 
-    display = hagl_init();
-
-    hagl_clear(display);
-    hagl_set_clip(display, 0, 20, display->width - 1, display->height - 21);
-
-    /* Change demo every 10 seconds. */
-    add_repeating_timer_ms(5000, switch_timer_callback, NULL, &switch_timer);
-
-    /* Update displayed FPS counter every 250 ms. */
-    add_repeating_timer_ms(250, show_timer_callback, NULL, &show_timer);
-
-
-    init_sine_table();
-    note_frames_remaining = current_melody[0].duration;
-    phase_increment = (uint32_t)(((uint64_t)current_melody[0].freq << 32) / AUDIO_SAMPLE_RATE);
-
-    // Pre-fill audio buffer
-    generate_audio();
-
-    // Main loop - animation + audio
-    uint32_t last_frame = 0;
-    bool led_state = false;
-
+    // ── Core 0: Ring buffer processing loop (runs forever) ───────────────────
+    // Drains validated packets from ring buffer and dispatches them.
+    // This is the "GPU work" loop — packet parse + draw + query response.
     while (1) {
-        // Keep audio buffer fed
-        generate_audio();
-
-        while (video_frame_count == last_frame) {
-            generate_audio();
-            tight_loop_contents();
-        }
-        last_frame = video_frame_count;
-
-        // from pico_effects
-        {
-            // uint64_t start = time_us_64();
-
-            switch (effect) {
-                case 0:
-                    metaballs_animate(display);
-                    metaballs_render(display);
-                    break;
-                case 1:
-                    plasma_animate(display);
-                    plasma_render(display);
-                    break;
-                case 2:
-                    rotozoom_animate();
-                    rotozoom_render(display);
-                    break;
-                case 3:
-                    deform_animate();
-                    deform_render(display);
-                    break;
-            }
-
-            /* Update the displayed fps if requested. */
-            show_fps();
-
-            /* Flush back buffer contents to display. NOP if single buffering. */
-            bytes = hagl_flush(display);
-
-            aps_update(&bps, bytes);
-            fps_update(&fps);
-
-            /* Print the message in console and switch to next demo. */
-            if (switch_flag) {
-                printf(
-                    "[main] %s at %d fps / %d kBps\r\n",
-                    demo[effect],
-                    (uint32_t)fps.current,
-                    (uint32_t)(bps.current / 1024)
-                );
-                switch_demo();
-            }
-
-            // /* Cap the demos to 60 fps. This is mostly to accommodate to smaller */
-            // /* screens where plasma will run too fast. */
-            // busy_wait_until(start + US_PER_FRAME_60_FPS);
+        // Check for RESET pulse from host
+        if (g_reset_requested) {
+            g_reset_requested = false;
+            dispatch_command(OP_SOFT_RESET, NULL, 0);
         }
 
-        // Advance melody (one note step per frame)
-        advance_melody();
+        // Process as many complete packets as possible from the ring buffer
+        packets_process();
 
-        // LED heartbeat
-        if ((video_frame_count % 30) == 0) {
-            led_state = !led_state;
-            gpio_put(PICO_DEFAULT_LED_PIN, led_state);
+        // After dispatch, check if a query response was queued
+        uint32_t resp_len;
+        const uint8_t *resp = dispatch_get_response(&resp_len);
+        if (resp_len > 0) {
+            // Block until host reads the response (host must wait for CS low)
+            // The host asserts CS for MISO read after BUSY goes low + 50 µs.
+            // We output via software bit-bang synchronized to SCK.
+            spi_slave_send_response(resp, resp_len);
         }
 
-
+        // Update BUSY pin based on ring buffer fill level
+        spi_set_busy(rb_is_busy());
     }
 
+    // Unreachable
     return 0;
 }
