@@ -294,7 +294,7 @@ void gpu_flood_fill(int16_t x, int16_t y, uint16_t fill_color) {
 // Sprite commands
 // =============================================================================
 void gpu_blit_sprite(int16_t x, int16_t y, uint8_t w, uint8_t h,
-                     const uint8_t *pixels, uint32_t pixel_bytes) {
+                     uint8_t rle_flag, const uint8_t *pixels, uint32_t pixel_bytes) {
     // BLIT_SPRITE streams raw pixel data. Chunk by rows so each packet fits
     // within GPU_MAX_CHUNK_BYTES. Header is 7 bytes; data budget = 4089 bytes/chunk.
     // Each chunk is a full BLIT_SPRITE packet — the firmware draws as it receives.
@@ -318,7 +318,8 @@ void gpu_blit_sprite(int16_t x, int16_t y, uint8_t w, uint8_t h,
         uint8_t hdr[HDR];
         hdr[0] = (uint8_t)((uint16_t)x & 0xFF); hdr[1] = (uint8_t)((uint16_t)x >> 8);
         hdr[2] = (uint8_t)((uint16_t)cur_y & 0xFF); hdr[3] = (uint8_t)((uint16_t)cur_y >> 8);
-        hdr[4] = w; hdr[5] = chunk_h; hdr[6] = 0; // rle=0
+        hdr[4] = w; hdr[5] = chunk_h; hdr[6] = rle_flag;
+
 
         // Build packet: header + pixel chunk
         uint16_t plen = (uint16_t)(HDR + chunk_px);
@@ -348,7 +349,8 @@ void gpu_blit_sprite(int16_t x, int16_t y, uint8_t w, uint8_t h,
     }
 }
 
-void gpu_upload_vram(uint32_t byte_offset, const uint8_t *data, uint32_t byte_count) {
+void gpu_upload_vram(uint32_t byte_offset, uint8_t rle_flag,
+                     const uint8_t *data, uint32_t byte_count) {
     // Split into chunks of UPLOAD_VRAM_DATA_MAX bytes each.
     // Each chunk is a complete UPLOAD_VRAM packet with its own CRC and offset field.
     // The GPU's handle_upload_vram() writes each chunk directly to g_vram+offset,
@@ -367,7 +369,8 @@ void gpu_upload_vram(uint32_t byte_offset, const uint8_t *data, uint32_t byte_co
         hdr[2] = (uint8_t)(offset >> 16);  hdr[3] = (uint8_t)(offset >> 24);
         hdr[4] = (uint8_t)(chunk);         hdr[5] = (uint8_t)(chunk >> 8);
         hdr[6] = (uint8_t)(chunk >> 16);   hdr[7] = (uint8_t)(chunk >> 24);
-        hdr[8] = 0; // rle_flag = 0 (Phase 3)
+        hdr[8] = rle_flag;
+
 
         uint16_t plen = (uint16_t)(UPLOAD_VRAM_HDR_SIZE + chunk);
         uint8_t  pre[3] = { GPU_OP_UPLOAD_VRAM,
@@ -596,3 +599,220 @@ uint8_t gpu_get_events(gpu_event_record_t *out, uint8_t max_count) {
     }
     return n;
 }
+
+// =============================================================================
+// Phase 3 — FPU Primitives
+// =============================================================================
+void gpu_bezier_quad(int16_t x0, int16_t y0, int16_t cx, int16_t cy,
+                     int16_t x1, int16_t y1, uint8_t steps, uint16_t color) {
+    uint8_t p[16];
+    p[0] = GPU_PRIM_BEZIER_QUAD;
+    p[1] = (uint8_t)(x0); p[2] = (uint8_t)(x0 >> 8);
+    p[3] = (uint8_t)(y0); p[4] = (uint8_t)(y0 >> 8);
+    p[5] = (uint8_t)(cx); p[6] = (uint8_t)(cx >> 8);
+    p[7] = (uint8_t)(cy); p[8] = (uint8_t)(cy >> 8);
+    p[9] = (uint8_t)(x1); p[10]= (uint8_t)(x1 >> 8);
+    p[11]= (uint8_t)(y1); p[12]= (uint8_t)(y1 >> 8);
+    p[13]= steps;
+    p[14]= (uint8_t)(color); p[15] = (uint8_t)(color >> 8);
+    gpu_send_command(GPU_OP_DRAW_PRIMITIVE, p, 16);
+}
+
+void gpu_bezier_cubic(int16_t x0, int16_t y0, int16_t cx0, int16_t cy0,
+                      int16_t cx1, int16_t cy1, int16_t x1, int16_t y1,
+                      uint8_t steps, uint16_t color) {
+    uint8_t p[20];
+    p[0] = GPU_PRIM_BEZIER_CUBIC;
+    p[1] = (uint8_t)(x0); p[2] = (uint8_t)(x0 >> 8);
+    p[3] = (uint8_t)(y0); p[4] = (uint8_t)(y0 >> 8);
+    p[5] = (uint8_t)(cx0); p[6]= (uint8_t)(cx0 >> 8);
+    p[7] = (uint8_t)(cy0); p[8]= (uint8_t)(cy0 >> 8);
+    p[9] = (uint8_t)(cx1); p[10]= (uint8_t)(cx1 >> 8);
+    p[11]= (uint8_t)(cy1); p[12]= (uint8_t)(cy1 >> 8);
+    p[13]= (uint8_t)(x1); p[14]= (uint8_t)(x1 >> 8);
+    p[15]= (uint8_t)(y1); p[16]= (uint8_t)(y1 >> 8);
+    p[17]= steps;
+    p[18]= (uint8_t)(color); p[19] = (uint8_t)(color >> 8);
+    gpu_send_command(GPU_OP_DRAW_PRIMITIVE, p, 20);
+}
+
+void gpu_gradient_rect(int16_t x, int16_t y, int16_t w, int16_t h,
+                       uint16_t c0, uint16_t c1, uint8_t direction) {
+    uint8_t p[14];
+    p[0] = GPU_PRIM_GRADIENT_RECT;
+    p[1] = (uint8_t)(x); p[2] = (uint8_t)(x >> 8);
+    p[3] = (uint8_t)(y); p[4] = (uint8_t)(y >> 8);
+    p[5] = (uint8_t)(w); p[6] = (uint8_t)(w >> 8);
+    p[7] = (uint8_t)(h); p[8] = (uint8_t)(h >> 8);
+    p[9] = (uint8_t)(c0); p[10]= (uint8_t)(c0 >> 8);
+    p[11]= (uint8_t)(c1); p[12]= (uint8_t)(c1 >> 8);
+    p[13]= direction;
+    gpu_send_command(GPU_OP_DRAW_PRIMITIVE, p, 14);
+}
+
+void gpu_triangle_gradient(int16_t x0, int16_t y0, uint16_t c0,
+                           int16_t x1, int16_t y1, uint16_t c1,
+                           int16_t x2, int16_t y2, uint16_t c2) {
+    uint8_t p[19];
+    p[0] = GPU_PRIM_TRIANGLE_GRADIENT;
+    p[1] = (uint8_t)(x0); p[2] = (uint8_t)(x0 >> 8);
+    p[3] = (uint8_t)(y0); p[4] = (uint8_t)(y0 >> 8);
+    p[5] = (uint8_t)(c0); p[6] = (uint8_t)(c0 >> 8);
+    p[7] = (uint8_t)(x1); p[8] = (uint8_t)(x1 >> 8);
+    p[9] = (uint8_t)(y1); p[10]= (uint8_t)(y1 >> 8);
+    p[11]= (uint8_t)(c1); p[12]= (uint8_t)(c1 >> 8);
+    p[13]= (uint8_t)(x2); p[14]= (uint8_t)(x2 >> 8);
+    p[15]= (uint8_t)(y2); p[16]= (uint8_t)(y2 >> 8);
+    p[17]= (uint8_t)(c2); p[18]= (uint8_t)(c2 >> 8);
+    gpu_send_command(GPU_OP_DRAW_PRIMITIVE, p, 19);
+}
+
+// =============================================================================
+// Phase 3 — Regions and Tilemaps
+// =============================================================================
+void gpu_copy_region(int16_t src_x, int16_t src_y, int16_t w, int16_t h,
+                     int16_t dst_x, int16_t dst_y, uint8_t flags) {
+    uint8_t p[13];
+    p[0] = (uint8_t)(src_x); p[1] = (uint8_t)(src_x >> 8);
+    p[2] = (uint8_t)(src_y); p[3] = (uint8_t)(src_y >> 8);
+    p[4] = (uint8_t)(w);     p[5] = (uint8_t)(w >> 8);
+    p[6] = (uint8_t)(h);     p[7] = (uint8_t)(h >> 8);
+    p[8] = (uint8_t)(dst_x); p[9] = (uint8_t)(dst_x >> 8);
+    p[10]= (uint8_t)(dst_y); p[11]= (uint8_t)(dst_y >> 8);
+    p[12]= flags;
+    gpu_send_command(GPU_OP_COPY_REGION, p, 13);
+}
+
+void gpu_replace_color(uint16_t old_color, uint16_t new_color) {
+    uint8_t p[4];
+    p[0] = (uint8_t)(old_color); p[1] = (uint8_t)(old_color >> 8);
+    p[2] = (uint8_t)(new_color); p[3] = (uint8_t)(new_color >> 8);
+    gpu_send_command(GPU_OP_REPLACE_COLOR, p, 4);
+}
+
+void gpu_scroll_screen(int16_t dx, int16_t dy, uint8_t wrap_flag, uint16_t fill_color) {
+    uint8_t p[7];
+    p[0] = (uint8_t)(dx); p[1] = (uint8_t)(dx >> 8);
+    p[2] = (uint8_t)(dy); p[3] = (uint8_t)(dy >> 8);
+    p[4] = wrap_flag;
+    p[5] = (uint8_t)(fill_color); p[6] = (uint8_t)(fill_color >> 8);
+    gpu_send_command(GPU_OP_SCROLL_SCREEN, p, 7);
+}
+
+void gpu_draw_tilemap(uint32_t tile_vram_offset, uint32_t map_vram_offset,
+                      uint8_t tile_w, uint8_t tile_h, uint16_t map_cols, uint16_t map_rows,
+                      int16_t scroll_x, int16_t scroll_y) {
+    uint8_t p[18];
+    p[0] = (uint8_t)(tile_vram_offset); p[1] = (uint8_t)(tile_vram_offset >> 8);
+    p[2] = (uint8_t)(tile_vram_offset >> 16); p[3] = (uint8_t)(tile_vram_offset >> 24);
+    p[4] = (uint8_t)(map_vram_offset);  p[5] = (uint8_t)(map_vram_offset >> 8);
+    p[6] = (uint8_t)(map_vram_offset >> 16);  p[7] = (uint8_t)(map_vram_offset >> 24);
+    p[8] = tile_w; p[9] = tile_h;
+    p[10]= (uint8_t)(map_cols); p[11]= (uint8_t)(map_cols >> 8);
+    p[12]= (uint8_t)(map_rows); p[13]= (uint8_t)(map_rows >> 8);
+    p[14]= (uint8_t)(scroll_x); p[15]= (uint8_t)(scroll_x >> 8);
+    p[16]= (uint8_t)(scroll_y); p[17]= (uint8_t)(scroll_y >> 8);
+    gpu_send_command(GPU_OP_DRAW_TILEMAP, p, 18);
+}
+
+// =============================================================================
+// Phase 3 — Asset Extensions
+// =============================================================================
+void gpu_draw_9patch(uint32_t vram_offset, uint16_t sprite_w, uint16_t sprite_h,
+                     uint8_t corner_w, uint8_t corner_h,
+                     int16_t dst_x, int16_t dst_y, uint16_t dst_w, uint16_t dst_h) {
+    uint8_t p[18];
+    p[0] = (uint8_t)(vram_offset); p[1] = (uint8_t)(vram_offset >> 8);
+    p[2] = (uint8_t)(vram_offset >> 16); p[3] = (uint8_t)(vram_offset >> 24);
+    p[4] = (uint8_t)(sprite_w); p[5] = (uint8_t)(sprite_w >> 8);
+    p[6] = (uint8_t)(sprite_h); p[7] = (uint8_t)(sprite_h >> 8);
+    p[8] = corner_w; p[9] = corner_h;
+    p[10]= (uint8_t)(dst_x); p[11]= (uint8_t)(dst_x >> 8);
+    p[12]= (uint8_t)(dst_y); p[13]= (uint8_t)(dst_y >> 8);
+    p[14]= (uint8_t)(dst_w); p[15]= (uint8_t)(dst_w >> 8);
+    p[16]= (uint8_t)(dst_h); p[17]= (uint8_t)(dst_h >> 8);
+    gpu_send_command(GPU_OP_DRAW_9PATCH, p, 18);
+}
+
+void gpu_capture_region(int16_t src_x, int16_t src_y, uint16_t w, uint16_t h,
+                        uint32_t vram_offset) {
+    uint8_t p[12];
+    p[0] = (uint8_t)(src_x); p[1] = (uint8_t)(src_x >> 8);
+    p[2] = (uint8_t)(src_y); p[3] = (uint8_t)(src_y >> 8);
+    p[4] = (uint8_t)(w);     p[5] = (uint8_t)(w >> 8);
+    p[6] = (uint8_t)(h);     p[7] = (uint8_t)(h >> 8);
+    p[8] = (uint8_t)(vram_offset); p[9] = (uint8_t)(vram_offset >> 8);
+    p[10]= (uint8_t)(vram_offset >> 16); p[11]= (uint8_t)(vram_offset >> 24);
+    gpu_send_command(GPU_OP_CAPTURE_REGION, p, 12);
+}
+
+// =============================================================================
+// Phase 3 — Named VRAM
+// =============================================================================
+uint32_t gpu_fnv1a32(const char *name) {
+    uint32_t hash = 0x811C9DC5u;
+    while (*name) {
+        hash ^= (uint8_t)(*name++);
+        hash *= 0x01000193u;
+    }
+    return hash;
+}
+
+uint32_t gpu_vram_alloc_named(const char *name, uint32_t byte_count) {
+    uint32_t hash = gpu_fnv1a32(name);
+    uint8_t p[8];
+    p[0] = (uint8_t)(hash); p[1] = (uint8_t)(hash >> 8);
+    p[2] = (uint8_t)(hash >> 16); p[3] = (uint8_t)(hash >> 24);
+    p[4] = (uint8_t)(byte_count); p[5] = (uint8_t)(byte_count >> 8);
+    p[6] = (uint8_t)(byte_count >> 16); p[7] = (uint8_t)(byte_count >> 24);
+
+    uint8_t r[4];
+    if (gpu_query(GPU_OP_VRAM_ALLOC_NAMED, p, 8, r, 4)) {
+        return (uint32_t)r[0] | ((uint32_t)r[1]<<8) | ((uint32_t)r[2]<<16) | ((uint32_t)r[3]<<24);
+    }
+    return GPU_VRAM_OFFSET_INVALID;
+}
+
+uint32_t gpu_vram_lookup(const char *name) {
+    uint32_t hash = gpu_fnv1a32(name);
+    uint8_t p[4];
+    p[0] = (uint8_t)(hash); p[1] = (uint8_t)(hash >> 8);
+    p[2] = (uint8_t)(hash >> 16); p[3] = (uint8_t)(hash >> 24);
+
+    uint8_t r[4];
+    if (gpu_query(GPU_OP_VRAM_LOOKUP, p, 4, r, 4)) {
+        return (uint32_t)r[0] | ((uint32_t)r[1]<<8) | ((uint32_t)r[2]<<16) | ((uint32_t)r[3]<<24);
+    }
+    return GPU_VRAM_OFFSET_INVALID;
+}
+
+void gpu_vram_free_named(const char *name) {
+    uint32_t hash = gpu_fnv1a32(name);
+    uint8_t p[4];
+    p[0] = (uint8_t)(hash); p[1] = (uint8_t)(hash >> 8);
+    p[2] = (uint8_t)(hash >> 16); p[3] = (uint8_t)(hash >> 24);
+    gpu_send_command(GPU_OP_VRAM_FREE_NAMED, p, 4);
+}
+
+// =============================================================================
+// Phase 3 — Display Lists
+// =============================================================================
+void gpu_begin_display_list(uint8_t slot_id, uint32_t vram_offset, uint32_t max_bytes) {
+    uint8_t p[9];
+    p[0] = slot_id;
+    p[1] = (uint8_t)(vram_offset); p[2] = (uint8_t)(vram_offset >> 8);
+    p[3] = (uint8_t)(vram_offset >> 16); p[4] = (uint8_t)(vram_offset >> 24);
+    p[5] = (uint8_t)(max_bytes); p[6] = (uint8_t)(max_bytes >> 8);
+    p[7] = (uint8_t)(max_bytes >> 16); p[8] = (uint8_t)(max_bytes >> 24);
+    gpu_send_command(GPU_OP_BEGIN_DISPLAY_LIST, p, 9);
+}
+
+void gpu_end_display_list(void) {
+    gpu_send_command(GPU_OP_END_DISPLAY_LIST, NULL, 0);
+}
+
+void gpu_exec_display_list(uint8_t slot_id) {
+    uint8_t p[1] = { slot_id };
+    gpu_send_command(GPU_OP_EXEC_DISPLAY_LIST, p, 1);
+}
+

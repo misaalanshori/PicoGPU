@@ -104,6 +104,10 @@
 #define GPU_ERR_VM_UNAVAILABLE      0x08u
 #define GPU_ERR_OVERFLOW            0x09u
 #define GPU_ERR_PAYLOAD_TOO_LARGE   0x0Au
+#define GPU_ERR_VRAM_NAME_NOT_FOUND 0x0Bu  // VRAM_LOOKUP: hash not in table
+#define GPU_ERR_VRAM_NAME_TABLE_FULL 0x0Cu // VRAM_ALLOC_NAMED: all 64 slots used
+#define GPU_ERR_DISPLAY_LIST_FULL   0x0Du  // recording exceeded max_bytes
+#define GPU_ERR_UNSUPPORTED         0x0Eu  // SET_PIXEL_FORMAT rejected by HAL
 #define GPU_ERR_INTERNAL            0xFFu
 
 // =============================================================================
@@ -153,3 +157,42 @@
 #define GPU_TRANSFORM_HFLIP         0x04u
 #define GPU_TRANSFORM_VFLIP         0x08u
 #define GPU_TRANSFORM_PALETTE       0x10u
+
+// =============================================================================
+// Named-VRAM constants (VRAM_ALLOC_NAMED / VRAM_LOOKUP / VRAM_FREE_NAMED)
+// =============================================================================
+// Sentinel returned in the 4-byte MISO response when a named-VRAM op fails.
+#define GPU_VRAM_OFFSET_INVALID     0xFFFFFFFFu
+
+// Maximum entries in the GPU named-slot table (firmware constant, for reference).
+#define GPU_NAMED_VRAM_SLOTS        64u
+
+// FNV-1a 32-bit hash — use gpu_fnv1a32() to compute the name hash that the
+// GPU firmware expects in VRAM_ALLOC_NAMED / VRAM_LOOKUP / VRAM_FREE_NAMED.
+// The function is provided in gpu_driver.c.
+uint32_t gpu_fnv1a32(const char *name);
+
+// =============================================================================
+// Display-list constants (BEGIN_DISPLAY_LIST / EXEC_DISPLAY_LIST)
+// =============================================================================
+// Maximum recordable slot index (0–63).
+#define GPU_DL_MAX_SLOTS            64u
+
+// Maximum nesting depth for EXEC_DISPLAY_LIST calls.
+#define GPU_DL_MAX_EXEC_DEPTH       4u
+
+// BLIT_SPRITE RLE flag values
+#define GPU_BLIT_RAW                0x00u  // raw pixel data
+#define GPU_BLIT_RLE                0x01u  // spec §5.7 RLE encoding
+
+// SCROLL_SCREEN wrap flag
+#define GPU_SCROLL_CLAMP            0x00u
+#define GPU_SCROLL_WRAP             0x01u
+
+// DRAW_TILEMAP / COPY_REGION flags
+#define GPU_REGION_FLAGS_NONE       0x00u
+#define GPU_REGION_FLAGS_WRAP       0x01u
+
+// Gradient direction for gpu_gradient_rect()
+#define GPU_GRADIENT_HORIZONTAL     0x00u
+#define GPU_GRADIENT_VERTICAL       0x01u

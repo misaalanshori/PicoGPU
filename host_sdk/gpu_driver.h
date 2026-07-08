@@ -95,12 +95,14 @@ void gpu_flood_fill(int16_t x, int16_t y, uint16_t fill_color);
 // Sprite commands
 // =============================================================================
 
-// BLIT_SPRITE: stream raw pixel data (no transforms)
+// BLIT_SPRITE: stream raw pixel data or RLE data
 void gpu_blit_sprite(int16_t x, int16_t y, uint8_t w, uint8_t h,
-                     const uint8_t *pixels, uint32_t pixel_bytes);
+                     uint8_t rle_flag, const uint8_t *pixels, uint32_t pixel_bytes);
 
 // UPLOAD_VRAM: write sprite data to GPU VRAM at byte_offset
-void gpu_upload_vram(uint32_t byte_offset, const uint8_t *data, uint32_t byte_count);
+void gpu_upload_vram(uint32_t byte_offset, uint8_t rle_flag,
+                     const uint8_t *data, uint32_t byte_count);
+
 
 // DRAW_VRAM_SPRITE: blit from VRAM with optional transforms
 void gpu_draw_vram_sprite(int16_t x, int16_t y, uint16_t w, uint16_t h,
@@ -172,3 +174,67 @@ typedef struct {
 // Returns the number of events written into out[] (0 if none or on error).
 // out[] must have room for at least max_count entries.
 uint8_t gpu_get_events(gpu_event_record_t *out, uint8_t max_count);
+
+// =============================================================================
+// Phase 3 — FPU Primitives
+// =============================================================================
+void gpu_bezier_quad(int16_t x0, int16_t y0, int16_t cx, int16_t cy,
+                     int16_t x1, int16_t y1, uint8_t steps, uint16_t color);
+
+void gpu_bezier_cubic(int16_t x0, int16_t y0, int16_t cx0, int16_t cy0,
+                      int16_t cx1, int16_t cy1, int16_t x1, int16_t y1,
+                      uint8_t steps, uint16_t color);
+
+void gpu_gradient_rect(int16_t x, int16_t y, int16_t w, int16_t h,
+                       uint16_t c0, uint16_t c1, uint8_t direction);
+
+void gpu_triangle_gradient(int16_t x0, int16_t y0, uint16_t c0,
+                           int16_t x1, int16_t y1, uint16_t c1,
+                           int16_t x2, int16_t y2, uint16_t c2);
+
+// =============================================================================
+// Phase 3 — Regions and Tilemaps
+// =============================================================================
+void gpu_copy_region(int16_t src_x, int16_t src_y, int16_t w, int16_t h,
+                     int16_t dst_x, int16_t dst_y, uint8_t flags);
+
+void gpu_replace_color(uint16_t old_color, uint16_t new_color);
+
+void gpu_scroll_screen(int16_t dx, int16_t dy, uint8_t wrap_flag, uint16_t fill_color);
+
+void gpu_draw_tilemap(uint32_t tile_vram_offset, uint32_t map_vram_offset,
+                      uint8_t tile_w, uint8_t tile_h, uint16_t map_cols, uint16_t map_rows,
+                      int16_t scroll_x, int16_t scroll_y);
+
+// =============================================================================
+// Phase 3 — Asset Extensions
+// =============================================================================
+void gpu_draw_9patch(uint32_t vram_offset, uint16_t sprite_w, uint16_t sprite_h,
+                     uint8_t corner_w, uint8_t corner_h,
+                     int16_t dst_x, int16_t dst_y, uint16_t dst_w, uint16_t dst_h);
+
+void gpu_capture_region(int16_t src_x, int16_t src_y, uint16_t w, uint16_t h,
+                        uint32_t vram_offset);
+
+// =============================================================================
+// Phase 3 — Named VRAM
+// =============================================================================
+// Allocates bytes in VRAM and links them to name's hash. Returns the offset
+// (or GPU_VRAM_OFFSET_INVALID on failure). Idempotent if name already exists
+// and matches size.
+uint32_t gpu_vram_alloc_named(const char *name, uint32_t byte_count);
+
+// Returns the VRAM offset for name's hash, or GPU_VRAM_OFFSET_INVALID.
+uint32_t gpu_vram_lookup(const char *name);
+
+// Frees the named VRAM block.
+void gpu_vram_free_named(const char *name);
+
+// =============================================================================
+// Phase 3 — Display Lists
+// =============================================================================
+void gpu_begin_display_list(uint8_t slot_id, uint32_t vram_offset, uint32_t max_bytes);
+void gpu_end_display_list(void);
+void gpu_exec_display_list(uint8_t slot_id);
+
+
