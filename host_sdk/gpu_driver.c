@@ -483,3 +483,116 @@ uint32_t gpu_get_capabilities(void) {
     gpu_query(GPU_OP_GET_CAPABILITIES, NULL, 0, r, 4);
     return (uint32_t)r[0] | ((uint32_t)r[1]<<8) | ((uint32_t)r[2]<<16) | ((uint32_t)r[3]<<24);
 }
+
+// GET_FRAME_STATS — fixed 8-byte response
+bool gpu_get_frame_stats(uint16_t *render_ms, uint8_t *ring_peak_pct,
+                         uint8_t *missed_frames, uint32_t *frame_count) {
+    uint8_t r[8] = {0};
+    bool ok = gpu_query(GPU_OP_GET_FRAME_STATS, NULL, 0, r, 8);
+    if (ok) {
+        if (render_ms)    *render_ms    = (uint16_t)r[0] | ((uint16_t)r[1] << 8);
+        if (ring_peak_pct)*ring_peak_pct = r[2];
+        if (missed_frames)*missed_frames = r[3];
+        if (frame_count)  *frame_count   = (uint32_t)r[4] | ((uint32_t)r[5]<<8)
+                                         | ((uint32_t)r[6]<<16) | ((uint32_t)r[7]<<24);
+    }
+    return ok;
+}
+
+// =============================================================================
+// Phase 2 — Scissor, Pixel Format, Frame Lifecycle
+// =============================================================================
+
+void gpu_push_clip_rect(int16_t x, int16_t y, int16_t w, int16_t h) {
+    // Payload: x(2B LE), y(2B LE), w(2B LE), h(2B LE) — 8 bytes
+    uint8_t p[8];
+    put16(p+0, x); put16(p+2, y); put16(p+4, w); put16(p+6, h);
+    gpu_send_command(GPU_OP_PUSH_CLIP_RECT, p, 8);
+}
+
+void gpu_pop_clip_rect(void) {
+    gpu_send_command(GPU_OP_POP_CLIP_RECT, NULL, 0);
+}
+
+void gpu_set_pixel_format(uint8_t format) {
+    // Payload: format_enum(1B)
+    gpu_send_command(GPU_OP_SET_PIXEL_FORMAT, &format, 1);
+}
+
+void gpu_begin_frame(void) {
+    gpu_send_command(GPU_OP_BEGIN_FRAME, NULL, 0);
+}
+
+void gpu_end_frame(void) {
+    gpu_send_command(GPU_OP_END_FRAME, NULL, 0);
+}
+
+// =============================================================================
+// Phase 2 — Event Buffer
+// =============================================================================
+// GET_EVENTS response is variable length:
+//   B0        = count N
+//   B1..BN*8  = N × 8-byte event records
+//
+// We implement this as a two-phase MISO read:
+//   1. Send the GET_EVENTS command via gpu_query() requesting 1 byte (count)
+//   2. While CS is still asserted (or after re-asserting per protocol), clock in N×8 more bytes
+//
+// Because our gpu_query() deasserts CS after reading, and the GPU holds the response
+// in s_response_buf until the next command, we handle this by reading the count first
+// then immediately reading the event records in the same CS window using gpu_hal_spi_read().
+uint8_t gpu_get_events(gpu_event_record_t *out, uint8_t max_count) {
+    if (!out || max_count == 0) return 0;
+
+    // Send GET_EVENTS command; wait for BUSY to clear
+    gpu_wait_not_busy(0);
+
+    // Build and send the command packet manually so we can keep CS low for the full read
+    if (!s_crc_ready) crc16_init_table();
+    uint8_t opcode = GPU_OP_GET_EVENTS;
+    uint8_t pre[3] = { opcode, 0, 0 };  // payload len = 0
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < 3; i++)
+        crc = (uint16_t)((crc<<8)^s_crc_table[(crc>>8)^pre[i]]);
+    uint8_t crc_b[2] = { (uint8_t)(crc&0xFF), (uint8_t)(crc>>8) };
+    uint8_t sync = GPU_SYNC_BYTE;
+
+    gpu_hal_cs_assert();
+    gpu_hal_spi_write(&sync, 1);
+    gpu_hal_spi_write(pre, 3);
+    gpu_hal_spi_write(crc_b, 2);
+    gpu_hal_cs_deassert();
+
+    // Wait for BUSY to clear again (GPU prepares response in s_response_buf)
+    gpu_wait_not_busy(0);
+    gpu_hal_delay_us(50);
+
+    // Read response: first byte is event count N
+    uint8_t count_byte = 0;
+    gpu_hal_cs_assert();
+    gpu_hal_spi_read(&count_byte, 1);
+
+    uint8_t n = count_byte;
+    if (n > max_count) n = max_count;
+    if (n == 0) {
+        gpu_hal_cs_deassert();
+        return 0;
+    }
+
+    // Read N × 8 bytes of event records
+    uint8_t raw[16 * 8];  // max 16 events × 8 bytes = 128 bytes
+    uint8_t read_n = (count_byte < 16u) ? count_byte : 16u;  // cap to ring size
+    gpu_hal_spi_read(raw, (uint32_t)read_n * 8u);
+    gpu_hal_cs_deassert();
+
+    // Parse into out[]
+    for (uint8_t i = 0; i < n; i++) {
+        const uint8_t *p = raw + i * 8;
+        out[i].event_type   = p[0];
+        out[i].reserved     = p[1];
+        out[i].timestamp_ms = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
+        out[i].payload      = (uint32_t)p[4] | ((uint32_t)p[5]<<8)
+                            | ((uint32_t)p[6]<<16) | ((uint32_t)p[7]<<24);
+    }
+    return n;
+}

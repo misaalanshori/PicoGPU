@@ -123,3 +123,52 @@ uint32_t gpu_get_vram_used(void);
 uint32_t gpu_get_sram_free(void);
 void     gpu_get_version(uint8_t *major, uint8_t *minor, uint16_t *patch);
 uint32_t gpu_get_capabilities(void);
+
+// GET_FRAME_STATS response (8 bytes, spec §5.5)
+bool gpu_get_frame_stats(uint16_t *render_ms, uint8_t *ring_peak_pct,
+                         uint8_t *missed_frames, uint32_t *frame_count);
+
+// =============================================================================
+// Phase 2 — Scissor, Pixel Format, Frame Lifecycle, Events
+// =============================================================================
+
+// PUSH_CLIP_RECT (0x20): intersect with current clip, push result (max depth 8)
+void gpu_push_clip_rect(int16_t x, int16_t y, int16_t w, int16_t h);
+
+// POP_CLIP_RECT (0x21): restore parent clip
+void gpu_pop_clip_rect(void);
+
+// SET_PIXEL_FORMAT (0x14): switch format within active bpp_class
+// format: PIXEL_FORMAT_* from gpu_opcodes.h (e.g. GPU_PIXEL_FORMAT_RGB332)
+void gpu_set_pixel_format(uint8_t format);
+
+// BEGIN_FRAME (0x12): mark start of frame (resets ring peak counter, starts timer)
+void gpu_begin_frame(void);
+
+// END_FRAME (0x13): mark end of frame (updates stats, fires deferred swap, pushes event)
+void gpu_end_frame(void);
+
+// =============================================================================
+// Phase 2 — Event Buffer
+// =============================================================================
+
+// Event record — 8 bytes, matches GET_EVENTS (0xE9) wire format
+typedef struct {
+    uint8_t  event_type;    // GPU_EVT_* code
+    uint8_t  reserved;      // always 0x00
+    uint16_t timestamp_ms;  // ms timestamp from GPU clock
+    uint32_t payload;       // event-specific data
+} gpu_event_record_t;
+
+// Event type codes (matches firmware event_buffer.h EVT_*)
+#define GPU_EVT_FRAME_COMPLETE   0x01u
+#define GPU_EVT_VM_PROC_DONE     0x02u
+#define GPU_EVT_VRAM_NEARLY_FULL 0x03u
+#define GPU_EVT_ERROR            0x04u
+#define GPU_EVT_BUFFER_OVERFLOW  0xFFu
+
+// GET_EVENTS (0xE9): drain the GPU event buffer.
+// Sends the query, reads the variable-length response (B0=count, then N×8-byte records).
+// Returns the number of events written into out[] (0 if none or on error).
+// out[] must have room for at least max_count entries.
+uint8_t gpu_get_events(gpu_event_record_t *out, uint8_t max_count);
