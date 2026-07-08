@@ -43,3 +43,12 @@ void handle_system_config(const uint8_t *payload, uint16_t len);
 
 // SOFT_RESET handler — return to UNINITIALIZED state, stop DVI output
 void handle_soft_reset(void);
+
+// Deferred draw queue (allocated from arena on BUFFERING_SINGLE_DEFERRED profiles).
+// Managed by profiles.c; consumed by dispatch.c at END_FRAME.
+#if FEATURE_DEFERRED_DRAW
+  #include "feature_flags.h"
+  extern uint8_t  *g_deferred_queue;       // NULL if not a deferred profile
+  extern uint32_t  g_deferred_queue_size;  // capacity in bytes
+  extern uint32_t  g_deferred_queue_write; // current write cursor
+#endif

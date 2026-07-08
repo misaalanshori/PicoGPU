@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include "feature_flags.h"
 
 // VRAM sprite cache management.
 // g_vram points into the arena, allocated by profiles.c during SYSTEM_CONFIG.
@@ -20,3 +21,9 @@ void handle_upload_vram(const uint8_t *payload, uint32_t len);
 uint32_t vram_get_free(void);
 // GET_VRAM_USED response
 uint32_t vram_get_used(void);
+
+#if FEATURE_CAPTURE_REGION
+// CAPTURE_REGION handler (opcode 0x53)
+// Payload: src_x(2B LE), src_y(2B LE), w(2B LE), h(2B LE), vram_offset(4B LE)
+void handle_capture_region(const uint8_t *payload, uint32_t len);
+#endif

@@ -1,6 +1,7 @@
 #include "vram.h"
 #include "error_codes.h"
 #include "../state/coprocessor_state.h"
+#include "../graphics/framebuffer.h"
 
 #include <string.h>
 #include <stddef.h>
@@ -105,3 +106,73 @@ uint32_t vram_get_used(void)
 {
     return g_vram_used;
 }
+
+// ---------------------------------------------------------------------------
+// handle_capture_region  (opcode 0x53)
+//
+// Copies a rectangle from the back framebuffer into VRAM.
+// Payload (12 bytes):
+//   [0..1]  src_x       (int16 LE)
+//   [2..3]  src_y       (int16 LE)
+//   [4..5]  w           (uint16 LE)
+//   [6..7]  h           (uint16 LE)
+//   [8..11] vram_offset (uint32 LE)
+// ---------------------------------------------------------------------------
+#if FEATURE_CAPTURE_REGION
+void handle_capture_region(const uint8_t *payload, uint32_t len)
+{
+    if (!g_fb_back) { coprocessor_set_error(ERR_NOT_ACTIVE); return; }
+    if (len < 12)   { coprocessor_set_error(ERR_INVALID_PARAM); return; }
+    if (g_vram == NULL) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
+
+    int16_t  src_x  = (int16_t)((uint16_t)payload[0] | ((uint16_t)payload[1] << 8));
+    int16_t  src_y  = (int16_t)((uint16_t)payload[2] | ((uint16_t)payload[3] << 8));
+    uint16_t w      = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+    uint16_t h      = (uint16_t)payload[6] | ((uint16_t)payload[7] << 8);
+    uint32_t voff   = (uint32_t)payload[8]  | ((uint32_t)payload[9]  << 8)
+                    | ((uint32_t)payload[10] << 16) | ((uint32_t)payload[11] << 24);
+
+    if (w == 0 || h == 0) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
+
+    uint32_t bpp        = (g_fb_bpp == 16) ? 2u : 1u;
+    uint32_t row_bytes  = (uint32_t)w * bpp;
+    uint32_t total_size = row_bytes * h;
+
+    if (voff + total_size > g_vram_size) { coprocessor_set_error(ERR_VRAM_FULL); return; }
+
+    for (uint16_t row = 0; row < h; row++) {
+        int16_t fy = src_y + (int16_t)row;
+        if (fy < 0 || fy >= (int16_t)g_fb_height) {
+            // Fill with zeros for out-of-bounds rows
+            memset(g_vram + voff + (uint32_t)row * row_bytes, 0, row_bytes);
+            continue;
+        }
+        // Clamp columns
+        uint16_t col_start = 0;
+        int16_t  fx_start  = src_x;
+        if (fx_start < 0) { col_start = (uint16_t)(-fx_start); }
+        uint16_t copy_cols = w;
+        if (fx_start + (int16_t)copy_cols > (int16_t)g_fb_width) {
+            copy_cols = (uint16_t)(g_fb_width - (uint16_t)(fx_start > 0 ? fx_start : 0));
+        }
+
+        uint8_t *dst_row = g_vram + voff + (uint32_t)row * row_bytes;
+        // Leading zeros if src_x < 0
+        if (col_start > 0) memset(dst_row, 0, (uint32_t)col_start * bpp);
+        // Copy valid pixels
+        uint32_t src_col = (fx_start < 0) ? 0u : (uint32_t)fx_start;
+        uint8_t *src_ptr = g_fb_back + (uint32_t)(uint16_t)fy * g_fb_stride + src_col * bpp;
+        uint32_t valid   = (col_start < copy_cols) ? (uint32_t)(copy_cols - col_start) : 0u;
+        if (valid > 0) memcpy(dst_row + (uint32_t)col_start * bpp, src_ptr, valid * bpp);
+        // Trailing zeros if needed
+        uint32_t written = (uint32_t)col_start + valid;
+        if (written < w) memset(dst_row + written * bpp, 0, (w - written) * bpp);
+    }
+
+    // Update high-water mark
+    uint32_t high = voff + total_size;
+    if (high > g_vram_used) g_vram_used = high;
+
+    coprocessor_set_error(ERR_OK);
+}
+#endif // FEATURE_CAPTURE_REGION

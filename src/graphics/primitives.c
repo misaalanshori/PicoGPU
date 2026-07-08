@@ -4,12 +4,14 @@
 // Pixel writes go through effect_write_pixel() / effect_fill_hspan().
 
 #include "primitives.h"
+#include "primitives_fpu.h"
 #include "effects.h"
 #include "framebuffer.h"
 #include "../state/coprocessor_state.h"
 #include "error_codes.h"
 #include "opcodes.h"
 #include "feature_flags.h"
+
 
 #include <stdlib.h>
 #include <string.h>
@@ -657,13 +659,18 @@ void handle_draw_primitive(const uint8_t *payload, uint16_t len) {
         case PRIM_TRIANGLE_FILLED:      prim_triangle_filled(payload, len);      break;
         case PRIM_POLYGON_FILLED:       prim_polygon_filled(payload, len);       break;
         case PRIM_FLOOD_FILL:           prim_flood_fill(payload, len);           break;
-        // FPU-only sub-opcodes — deferred to Phase 2
+        // FPU-only sub-opcodes — dispatch to primitives_fpu.c (RP2350 only)
         case PRIM_TRIANGLE_GRADIENT:
         case PRIM_BEZIER_QUAD:
         case PRIM_BEZIER_CUBIC:
         case PRIM_GRADIENT_RECT:
+#if FEATURE_FPU_PRIMITIVES
+            handle_draw_primitive_fpu(payload, len);
+#else
             coprocessor_set_error(ERR_FEATURE_UNAVAILABLE);
+#endif
             break;
+
         default:
             coprocessor_set_error(ERR_UNKNOWN_OPCODE);
             break;

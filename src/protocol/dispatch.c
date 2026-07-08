@@ -11,10 +11,15 @@
 #include "../memory/arena.h"
 #include "../graphics/effects.h"
 #include "../graphics/primitives.h"
+#include "../graphics/primitives_fpu.h"
 #include "../graphics/blit.h"
 #include "../graphics/text.h"
 #include "../graphics/scissor.h"
+#include "../graphics/region.h"
+#include "../graphics/nine_patch.h"
 #include "../assets/vram.h"
+#include "../assets/vram_named.h"
+#include "../assets/display_list.h"
 #include "../hal/rp2350/display_rp2350.h"
 #include "../transport/spi_slave.h"
 #include "../transport/ring_buffer.h"
@@ -25,6 +30,7 @@
 #include "pico/time.h"
 #include <string.h>
 #include <stdint.h>
+
 
 // MISO response buffer (spec §5.5) — max response size is GET_EVENTS (variable, capped at 256B)
 #define RESPONSE_BUF_SIZE 256u
@@ -343,12 +349,29 @@ static void handle_end_frame(void) {
         g_state.swap_pending = true;
     }
 
+#if FEATURE_DEFERRED_DRAW
+    // Single-deferred mode: flush the deferred command queue now
+    if (g_deferred_queue && g_deferred_queue_write > 0) {
+        uint32_t pos = 0;
+        while (pos + 3u <= g_deferred_queue_write) {
+            uint8_t  op   = g_deferred_queue[pos];
+            uint16_t plen = (uint16_t)g_deferred_queue[pos+1] |
+                            ((uint16_t)g_deferred_queue[pos+2] << 8);
+            if (pos + 3u + plen > g_deferred_queue_write) break;
+            dispatch_command(op, g_deferred_queue + pos + 3, plen);
+            pos += 3u + plen;
+        }
+        g_deferred_queue_write = 0;  // reset queue
+    }
+#endif
+
     // Push EVT_FRAME_COMPLETE to event buffer
     event_buffer_push(EVT_FRAME_COMPLETE, g_state.frame_count);
 
     g_state.in_frame = false;
     coprocessor_set_error(ERR_OK);
 }
+
 
 static void handle_set_dither_mode(const uint8_t *payload, uint16_t len) {
     if (len < 1) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
@@ -436,6 +459,52 @@ void dispatch_command(uint8_t opcode, const uint8_t *payload, uint16_t len) {
         return;
     }
 
+#if FEATURE_DISPLAY_LIST
+    // -------------------------------------------------------------------------
+    // Display list recording intercept:
+    // If recording is active, serialise this command into VRAM instead of
+    // executing it. Streaming commands and management opcodes are exempted
+    // inside dl_record_command() itself.
+    // -------------------------------------------------------------------------
+    if (dl_is_recording()) {
+        // BEGIN_DISPLAY_LIST during an active recording → forbidden; let the
+        // handler report ERR_INVALID_PARAM by falling through to normal dispatch.
+        if (opcode != OP_BEGIN_DISPLAY_LIST &&
+            opcode != OP_END_DISPLAY_LIST) {
+            if (dl_record_command(opcode, payload, len)) return;
+            // dl_record_command returned false → not recorded; fall through
+            // to execute normally (management / query opcodes).
+        }
+    }
+#endif
+
+#if FEATURE_DEFERRED_DRAW
+    // -------------------------------------------------------------------------
+    // Single-deferred mode intercept:
+    // Small fixed-payload draw commands are enqueued rather than executed
+    // immediately during active scanout. Streaming commands bypass this queue.
+    // Only active when a BUFFERING_SINGLE_DEFERRED profile is running.
+    // -------------------------------------------------------------------------
+    if (g_deferred_queue != NULL &&
+        opcode != OP_BLIT_SPRITE &&
+        opcode != OP_UPLOAD_VRAM &&
+        opcode != OP_LOAD_PROCEDURE) {
+        // Enqueue: [opcode(1B)][len_lo(1B)][len_hi(1B)][payload(len)]
+        uint32_t needed = 3u + (uint32_t)len;
+        if (g_deferred_queue_write + needed <= g_deferred_queue_size) {
+            uint8_t *p = g_deferred_queue + g_deferred_queue_write;
+            p[0] = opcode;
+            p[1] = (uint8_t)(len & 0xFF);
+            p[2] = (uint8_t)(len >> 8);
+            if (len > 0 && payload) __builtin_memcpy(p + 3, payload, len);
+            g_deferred_queue_write += needed;
+        } else {
+            coprocessor_set_error(ERR_OVERFLOW);
+        }
+        return;
+    }
+#endif
+
     switch (opcode) {
         case OP_DRAW_PRIMITIVE:     handle_draw_primitive(payload, len);         return;
         case OP_FILL_SCREEN:        handle_fill_screen(payload, len);            return;
@@ -444,19 +513,33 @@ void dispatch_command(uint8_t opcode, const uint8_t *payload, uint16_t len) {
         case OP_RENDER_TEXT:        handle_render_text(payload, len);            return;
         case OP_UPLOAD_VRAM:        handle_upload_vram(payload, len);            return;
 
-        // Remaining Phase 2+ stubs — return ERR_FEATURE_UNAVAILABLE
-        case OP_COPY_REGION:
-        case OP_REPLACE_COLOR:
-        case OP_SCROLL_SCREEN:
-        case OP_DRAW_TILEMAP:
-        case OP_DRAW_9PATCH:
-        case OP_CAPTURE_REGION:
-        case OP_BEGIN_DISPLAY_LIST:
-        case OP_END_DISPLAY_LIST:
-        case OP_EXEC_DISPLAY_LIST:
-        case OP_VRAM_ALLOC_NAMED:
-        case OP_VRAM_LOOKUP:
-        case OP_VRAM_FREE_NAMED:
+        // Phase 3: region ops
+        case OP_COPY_REGION:        handle_copy_region(payload, len);            return;
+        case OP_REPLACE_COLOR:      handle_replace_color(payload, len);          return;
+        case OP_SCROLL_SCREEN:      handle_scroll_screen(payload, len);          return;
+        case OP_DRAW_TILEMAP:       handle_draw_tilemap(payload, len);           return;
+
+        // Phase 3: blit / asset
+        case OP_DRAW_9PATCH:        handle_draw_9patch(payload, len);            return;
+#if FEATURE_CAPTURE_REGION
+        case OP_CAPTURE_REGION:     handle_capture_region(payload, len);         return;
+#endif
+
+        // Phase 3: named VRAM
+#if FEATURE_NAMED_VRAM
+        case OP_VRAM_ALLOC_NAMED:   handle_vram_alloc_named(payload, len);       return;
+        case OP_VRAM_LOOKUP:        handle_vram_lookup(payload, len);            return;
+        case OP_VRAM_FREE_NAMED:    handle_vram_free_named(payload, len);        return;
+#endif
+
+        // Phase 3: display lists
+#if FEATURE_DISPLAY_LIST
+        case OP_BEGIN_DISPLAY_LIST: handle_begin_display_list(payload, len);     return;
+        case OP_END_DISPLAY_LIST:   handle_end_display_list();                   return;
+        case OP_EXEC_DISPLAY_LIST:  handle_exec_display_list(payload, len);      return;
+#endif
+
+        // VM (Phase 4+)
         case OP_LOAD_PROCEDURE:
         case OP_EXEC_PROCEDURE:
         case OP_VM_RESET:

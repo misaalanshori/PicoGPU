@@ -13,6 +13,23 @@
 #include "opcodes.h"
 #include "feature_flags.h"
 
+#if FEATURE_NAMED_VRAM
+  #include "../assets/vram_named.h"
+#endif
+#if FEATURE_DISPLAY_LIST
+  #include "../assets/display_list.h"
+#endif
+
+// =============================================================================
+// Deferred queue globals (exposed via profiles.h)
+// =============================================================================
+#if FEATURE_DEFERRED_DRAW
+uint8_t  *g_deferred_queue      = NULL;
+uint32_t  g_deferred_queue_size = 0;
+uint32_t  g_deferred_queue_write = 0;
+#endif
+
+
 // =============================================================================
 // PLL parameters for HSTX clock (TIP §6.2)
 // pll_usb: VCO = XOSC(12MHz) * FBDIV, output = VCO / (postdiv1 * postdiv2)
@@ -205,8 +222,27 @@ void handle_system_config(const uint8_t *payload, uint16_t len) {
 
     // Reserve VM heap
     if (reserve_vm && prof->vm_heap_bytes > 0) {
-        arena_alloc(prof->vm_heap_bytes, 4); // reserved, Phase 2+
+        arena_alloc(prof->vm_heap_bytes, 4); // reserved, Phase 4+
     }
+
+#if FEATURE_DEFERRED_DRAW
+    // Allocate deferred draw queue for single-deferred profiles
+    if (prof->buffering == BUFFERING_SINGLE_DEFERRED) {
+        g_deferred_queue      = arena_alloc(DEFERRED_QUEUE_SIZE_BYTES, 4);
+        g_deferred_queue_size = DEFERRED_QUEUE_SIZE_BYTES;
+    } else {
+        g_deferred_queue      = NULL;
+        g_deferred_queue_size = 0;
+    }
+    g_deferred_queue_write = 0;
+#endif
+
+#if FEATURE_NAMED_VRAM
+    vram_named_clear();
+#endif
+#if FEATURE_DISPLAY_LIST
+    display_list_reset();
+#endif
 
     // Update state
     g_state.active_profile_id   = profile_id;
@@ -234,5 +270,16 @@ void handle_soft_reset(void) {
     g_fb_width = g_fb_height = 0;
     g_fb_stride = g_fb_size = 0;
     vram_init(NULL, 0);
+#if FEATURE_DEFERRED_DRAW
+    g_deferred_queue      = NULL;
+    g_deferred_queue_size = 0;
+    g_deferred_queue_write = 0;
+#endif
+#if FEATURE_NAMED_VRAM
+    vram_named_clear();
+#endif
+#if FEATURE_DISPLAY_LIST
+    display_list_reset();
+#endif
     coprocessor_state_init();
 }

@@ -9,8 +9,11 @@
 #include "../assets/vram.h"
 #include "../state/coprocessor_state.h"
 #include "error_codes.h"
+#include "feature_flags.h"
 
 #include <string.h>
+#include <math.h>
+
 
 // transform_flags bit layout (spec §7.2):
 //   bits [1:0] = rotation: 00=0°, 01=90° CW, 10=180°, 11=270° CW
@@ -33,7 +36,86 @@ static inline uint32_t rd32u_bl(const uint8_t *p) {
 }
 
 // =============================================================================
-// BLIT_SPRITE (0x50) — stream blit from packet payload (Phase 0/1: fully buffered)
+// RLE pixel decoder (spec §5.7)
+// Format: run-mode — (count:1B)(color:bpp_bytes) emits 'count' copies of color.
+//         literal mode — (0x00:1B)(n:1B)(raw_bytes: n×bpp_bytes) emits n literal pixels.
+// =============================================================================
+typedef struct {
+    const uint8_t *src;
+    uint32_t       src_len;
+    uint32_t       src_pos;
+    uint32_t       bpp;        // bytes per pixel
+    // run state
+    uint32_t       run_count;  // pixels remaining in current run
+    uint16_t       run_color;  // color of current run (only for run mode)
+    bool           in_run;     // true = emitting a run
+    // literal state
+    uint32_t       lit_count;  // raw pixels remaining
+    bool           in_literal; // true = emitting literals
+} rle_state_t;
+
+static void rle_init(rle_state_t *r, const uint8_t *src, uint32_t len, uint32_t bpp) {
+    r->src       = src;
+    r->src_len   = len;
+    r->src_pos   = 0;
+    r->bpp       = bpp;
+    r->run_count  = 0;
+    r->run_color  = 0;
+    r->in_run     = false;
+    r->lit_count  = 0;
+    r->in_literal = false;
+}
+
+// Returns true and sets *pix if a pixel is available; false if stream exhausted.
+static bool rle_next_pixel(rle_state_t *r, uint16_t *pix) {
+    if (r->in_run && r->run_count > 0) {
+        *pix = r->run_color;
+        r->run_count--;
+        if (r->run_count == 0) r->in_run = false;
+        return true;
+    }
+    if (r->in_literal && r->lit_count > 0) {
+        if (r->src_pos + r->bpp > r->src_len) return false;
+        if (r->bpp == 2) {
+            *pix = (uint16_t)r->src[r->src_pos] | ((uint16_t)r->src[r->src_pos+1] << 8);
+        } else {
+            *pix = r->src[r->src_pos];
+        }
+        r->src_pos += r->bpp;
+        r->lit_count--;
+        if (r->lit_count == 0) r->in_literal = false;
+        return true;
+    }
+    // Decode next token
+    if (r->src_pos >= r->src_len) return false;
+    uint8_t tok = r->src[r->src_pos++];
+    if (tok == 0x00u) {
+        // Literal sequence: next byte = count, then raw pixels
+        if (r->src_pos >= r->src_len) return false;
+        uint8_t n = r->src[r->src_pos++];
+        r->lit_count  = n;
+        r->in_literal = true;
+        return rle_next_pixel(r, pix);  // recurse once to emit first literal
+    } else {
+        // Run: tok = count, then one color value
+        if (r->src_pos + r->bpp > r->src_len) return false;
+        uint16_t col;
+        if (r->bpp == 2) {
+            col = (uint16_t)r->src[r->src_pos] | ((uint16_t)r->src[r->src_pos+1] << 8);
+        } else {
+            col = r->src[r->src_pos];
+        }
+        r->src_pos  += r->bpp;
+        r->run_color = col;
+        r->run_count = (uint32_t)tok - 1u;  // first pixel emitted below
+        r->in_run    = (r->run_count > 0);
+        *pix = col;
+        return true;
+    }
+}
+
+// =============================================================================
+// BLIT_SPRITE (0x50) — stream blit from packet payload
 // Payload: x(2LE), y(2LE), w(1), h(1), rle_flag(1), [pixel_data...]
 // =============================================================================
 void handle_blit_sprite(const uint8_t *payload, uint16_t len) {
@@ -46,36 +128,44 @@ void handle_blit_sprite(const uint8_t *payload, uint16_t len) {
     uint8_t  h       = payload[5];
     uint8_t  rle_flg = payload[6];
 
-    if (rle_flg) {
-        // RLE not yet implemented (Phase 3)
-        coprocessor_set_error(ERR_FEATURE_UNAVAILABLE);
-        return;
-    }
-
+    uint32_t bpp = (g_fb_bpp == 16) ? 2u : 1u;
     const uint8_t *src = payload + 7;
-    uint32_t expected = (uint32_t)w * h * (g_fb_bpp == 16 ? 2 : 1);
-    if (len < 7 + expected) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
+    uint32_t src_len   = (uint32_t)(len >= 7 ? len - 7u : 0u);
 
-    // Blit row by row, clipping to framebuffer bounds
-    for (uint8_t row = 0; row < h; row++) {
-        int16_t dst_row = dst_y + row;
-        if (dst_row < 0 || dst_row >= (int16_t)g_fb_height) {
-            src += w * (g_fb_bpp == 16 ? 2 : 1);
-            continue;
-        }
-        for (uint8_t col = 0; col < w; col++) {
-            int16_t dst_col = dst_x + col;
-            uint16_t pix;
-            if (g_fb_bpp == 16) {
-                pix = rd16u_bl(src); src += 2;
-            } else {
-                pix = *src++;
+    if (rle_flg == 0x01u) {
+        // RLE decode path
+        rle_state_t rle;
+        rle_init(&rle, src, src_len, bpp);
+        for (uint8_t row = 0; row < h; row++) {
+            for (uint8_t col = 0; col < w; col++) {
+                uint16_t pix = 0;
+                if (!rle_next_pixel(&rle, &pix)) goto blit_done;
+                effect_write_pixel(dst_x + col, dst_y + row, pix);
             }
-            effect_write_pixel(dst_col, dst_row, pix);
+        }
+    } else {
+        // Raw path
+        uint32_t expected = (uint32_t)w * h * bpp;
+        if (src_len < expected) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
+        for (uint8_t row = 0; row < h; row++) {
+            int16_t dst_row = dst_y + row;
+            if (dst_row < 0 || dst_row >= (int16_t)g_fb_height) {
+                src += (uint32_t)w * bpp;
+                continue;
+            }
+            for (uint8_t col = 0; col < w; col++) {
+                int16_t dst_col = dst_x + col;
+                uint16_t pix;
+                if (bpp == 2) { pix = rd16u_bl(src); src += 2; }
+                else          { pix = *src++; }
+                effect_write_pixel(dst_col, dst_row, pix);
+            }
         }
     }
+blit_done:
     coprocessor_set_error(ERR_OK);
 }
+
 
 // =============================================================================
 // DRAW_VRAM_SPRITE (0x51) — blit from VRAM with transforms
