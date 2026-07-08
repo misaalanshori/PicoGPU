@@ -12,15 +12,16 @@
 // ---------------------------------------------------------------------------
 // PIO program — SPI Mode 0 receiver (MSB-first, 3 instructions, wrap 0->2)
 // ---------------------------------------------------------------------------
-// [0] 0x2082  wait 1 gpio 2   (wait SCK HIGH  = rising edge; GPIO 2 = SCK)
-// [1] 0x4001  in   pins, 1   (sample MOSI;   in_base = GP0)
-// [2] 0x2002  wait 0 gpio 2   (wait SCK LOW)
+// [0] wait 1 gpio <SCK>   wait SCK HIGH (rising edge)
+// [1] in   pins, 1        sample MOSI (in_base = PIN_MOSI)
+// [2] wait 0 gpio <SCK>   wait SCK LOW
+//
+// The <SCK> field (bits [4:0] of WAIT instructions) is patched at runtime
+// from PIN_SCK so this is safe even if feature_flags.h changes the pin.
+// WAIT 1 GPIO template: 0x2080 | (pin & 0x1F)
+// WAIT 0 GPIO template: 0x2000 | (pin & 0x1F)
 // ---------------------------------------------------------------------------
-static const uint16_t spi_slave_program_instructions[] = {
-    0x2082u,  // wait 1 gpio 2
-    0x4001u,  // in   pins, 1
-    0x2002u,  // wait 0 gpio 2
-};
+static uint16_t spi_slave_program_instructions[3];  // filled by _spi_slave_pio_init
 
 #define SPI_SLAVE_PROG_LEN  3u
 #define SPI_SLAVE_WRAP_BOT  0u
@@ -35,6 +36,15 @@ static const uint16_t spi_slave_program_instructions[] = {
 
 static void _spi_slave_pio_init(void)
 {
+    // Patch the WAIT instructions with the actual PIN_SCK at runtime.
+    // This makes the program correct even if feature_flags.h changes PIN_SCK.
+    //   WAIT 1 GPIO <pin>: 0x2080 | (pin & 0x1F)
+    //   IN   pins, 1     : 0x4001  (no pin index in this instruction)
+    //   WAIT 0 GPIO <pin>: 0x2000 | (pin & 0x1F)
+    spi_slave_program_instructions[0] = (uint16_t)(0x2080u | (PIN_SCK & 0x1Fu));
+    spi_slave_program_instructions[1] = 0x4001u;
+    spi_slave_program_instructions[2] = (uint16_t)(0x2000u | (PIN_SCK & 0x1Fu));
+
     // Load program into PIO1
     uint offset = pio_add_program_at_offset(pio1, &(pio_program_t){
         .instructions = spi_slave_program_instructions,
@@ -165,6 +175,10 @@ void spi_slave_send_response(const uint8_t *data, uint32_t len)
     }
 
     gpio_put(PIN_MISO, 0);
+    // Tri-state MISO: release the line so it doesn't fight other devices
+    // if the bus is ever shared. Also guards against floating-input issues
+    // on the host side between query transactions.
+    gpio_set_dir(PIN_MISO, GPIO_IN);
 }
 
 void spi_set_busy(bool busy)
