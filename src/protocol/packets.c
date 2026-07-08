@@ -46,7 +46,12 @@ uint16_t crc16_compute(const uint8_t *data, uint32_t len)
 // Packet constants
 // ---------------------------------------------------------------------------
 #define SYNC_BYTE          0xAAu
-#define MAX_PAYLOAD_SIZE   65535u
+
+// Maximum payload bytes accepted in a single packet.
+// Must be <= RING_BUFFER_SIZE so a chunk can always be fully received before
+// the ring wraps. Large data (UPLOAD_VRAM, LOAD_PROCEDURE) must be split
+// into multiple packets by the host, each with an explicit byte offset.
+#define MAX_PAYLOAD_SIZE   RING_BUFFER_SIZE
 
 // ---------------------------------------------------------------------------
 // Parser state machine
@@ -61,8 +66,9 @@ typedef enum {
     PKT_CRC_HI,        // CRC high byte (then validate + dispatch)
 } pkt_state_t;
 
-// 64 KB scratch buffer for payload accumulation
-static uint8_t g_pkt_payload_buf[65536u];
+// 4 KB scratch buffer — matches ring buffer size.
+// Hosts must chunk large uploads; see MAX_PAYLOAD_SIZE.
+static uint8_t g_pkt_payload_buf[MAX_PAYLOAD_SIZE];
 
 static struct {
     pkt_state_t state;
@@ -138,6 +144,13 @@ uint32_t packets_process(void)
             g_parser.payload_len |= (uint16_t)(byte << 8u);
             g_parser.running_crc  = crc16_update(g_parser.running_crc, byte);
             g_parser.payload_idx  = 0;
+
+            // Reject oversized payloads immediately — host must chunk.
+            if (g_parser.payload_len > MAX_PAYLOAD_SIZE) {
+                coprocessor_set_error(ERR_INVALID_PARAM);
+                _reset_parser();
+                break;
+            }
 
             if (g_parser.payload_len == 0u) {
                 // No payload — go straight to CRC

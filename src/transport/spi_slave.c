@@ -88,13 +88,17 @@ static void _spi_slave_dma_init(void)
     // Trigger on PIO1 RX FIFO not-empty (one byte per dreq)
     channel_config_set_dreq(&cfg, pio_get_dreq(pio1, 0, /*is_tx=*/false));
 
-    // Configure the channel
+    // Transfer count: UINT32_MAX = run forever.
+    // DREQ from PIO RX FIFO throttles actual byte rate; the ring wrap
+    // (set_ring, size_bits=12) handles the circular overwrite behaviour.
+    // Using RING_BUFFER_SIZE here would halt DMA after 4096 bytes — a
+    // silent data-loss bug for any transfer longer than the ring.
     dma_channel_configure(
         SPI_DMA_CHAN,
         &cfg,
         rb_get_buffer(),                          // write: ring buffer base
         &pio1->rxf[0],                            // read:  PIO1 SM0 RX FIFO
-        RING_BUFFER_SIZE,                         // transfer count (restarts via dreq)
+        UINT32_MAX,                               // run forever; dreq controls rate
         /*trigger=*/true
     );
 }
