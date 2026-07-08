@@ -6,19 +6,23 @@
 #include "dispatch.h"
 #include "packets.h"
 #include "../state/coprocessor_state.h"
+#include "../state/event_buffer.h"
 #include "../memory/profiles.h"
 #include "../memory/arena.h"
 #include "../graphics/effects.h"
 #include "../graphics/primitives.h"
 #include "../graphics/blit.h"
 #include "../graphics/text.h"
+#include "../graphics/scissor.h"
 #include "../assets/vram.h"
 #include "../hal/rp2350/display_rp2350.h"
 #include "../transport/spi_slave.h"
+#include "../transport/ring_buffer.h"
 #include "error_codes.h"
 #include "opcodes.h"
 #include "feature_flags.h"
 
+#include "pico/time.h"
 #include <string.h>
 #include <stdint.h>
 
@@ -30,6 +34,8 @@ static uint32_t s_response_len = 0;
 void dispatch_init(void) {
     s_response_len = 0;
     memset(s_response_buf, 0, sizeof(s_response_buf));
+    scissor_init();
+    event_buffer_init();
 }
 
 void dispatch_set_response(const uint8_t *data, uint32_t len) {
@@ -174,9 +180,25 @@ static void handle_get_frame_stats(void) {
 }
 
 static void handle_get_events(void) {
-    // Phase 0/1: event buffer not implemented; return 0 events
-    uint8_t buf[1] = { 0x00 };
-    dispatch_set_response(buf, 1);
+    // Drain event buffer and build variable-length response:
+    //   B0      = count N
+    //   B1..BN*8 = N × 8-byte event records
+    gpu_event_t evts[EVENT_BUFFER_CAPACITY];
+    uint8_t n = event_buffer_drain(evts, EVENT_BUFFER_CAPACITY);
+
+    uint8_t *p = s_response_buf;
+    *p++ = n;
+    for (uint8_t i = 0; i < n; i++) {
+        *p++ = evts[i].event_type;
+        *p++ = evts[i].reserved;
+        *p++ = (uint8_t)(evts[i].timestamp_ms & 0xFF);
+        *p++ = (uint8_t)(evts[i].timestamp_ms >> 8);
+        *p++ = (uint8_t)(evts[i].payload);
+        *p++ = (uint8_t)(evts[i].payload >> 8);
+        *p++ = (uint8_t)(evts[i].payload >> 16);
+        *p++ = (uint8_t)(evts[i].payload >> 24);
+    }
+    s_response_len = (uint32_t)(1u + (uint32_t)n * 8u);
 }
 
 static void handle_get_font_metadata(const uint8_t *payload, uint16_t len) {
@@ -230,7 +252,101 @@ static void handle_swap_buffers_immediate(void) {
 
 static void handle_enable_frame_stats(const uint8_t *payload, uint16_t len) {
     if (len < 1) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
-    g_state.frame_stats_enabled = (payload[0] != 0);
+    bool enabling = (payload[0] != 0);
+    if (enabling && !g_state.frame_stats_enabled) {
+        // Reset counters when re-enabling
+        g_state.frame_count    = 0;
+        g_state.last_render_ms = 0;
+        g_state.ring_peak_pct  = 0;
+        g_state.missed_frames  = 0;
+    }
+    g_state.frame_stats_enabled = enabling;
+    coprocessor_set_error(ERR_OK);
+}
+
+// Phase 2: scissor, pixel format, frame lifecycle
+
+static void handle_push_clip_rect(const uint8_t *payload, uint16_t len) {
+    // Payload: x(2B LE), y(2B LE), w(2B LE), h(2B LE) — 8 bytes (spec §5.2)
+    if (len < 8) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
+    int16_t x = (int16_t)((uint16_t)payload[0] | ((uint16_t)payload[1] << 8));
+    int16_t y = (int16_t)((uint16_t)payload[2] | ((uint16_t)payload[3] << 8));
+    int16_t w = (int16_t)((uint16_t)payload[4] | ((uint16_t)payload[5] << 8));
+    int16_t h = (int16_t)((uint16_t)payload[6] | ((uint16_t)payload[7] << 8));
+    if (!scissor_push(x, y, w, h)) return;  // error already set by scissor_push
+    coprocessor_set_error(ERR_OK);
+}
+
+static void handle_pop_clip_rect(void) {
+    if (!scissor_pop()) return;  // error already set by scissor_pop
+    coprocessor_set_error(ERR_OK);
+}
+
+static void handle_set_pixel_format(const uint8_t *payload, uint16_t len) {
+    // Payload: format_enum(1B) (spec §5.2)
+    if (len < 1) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
+    uint8_t fmt = payload[0];
+
+    // Validate: format high nibble must match active bpp_class
+    //   0x0X = 8bpp, 0x1X = 16bpp, 0x2X = 4bpp, 0x3X = 24bpp
+    uint8_t fmt_nibble = fmt >> 4;
+    uint8_t state_nibble;
+    switch (g_state.bpp_class) {
+        case  8: state_nibble = 0; break;
+        case 16: state_nibble = 1; break;
+        case  4: state_nibble = 2; break;
+        case 24: state_nibble = 3; break;
+        default: coprocessor_set_error(ERR_NOT_ACTIVE); return;
+    }
+    if (fmt_nibble != state_nibble) {
+        coprocessor_set_error(ERR_INVALID_PARAM);
+        return;
+    }
+
+    if (!display_rp2350_set_pixel_format(fmt)) {
+        coprocessor_set_error(ERR_UNSUPPORTED);
+        return;
+    }
+    g_state.active_pixel_format = fmt;
+    coprocessor_set_error(ERR_OK);
+}
+
+static void handle_begin_frame(void) {
+    // Missed frame detection: if a previous deferred swap is still pending,
+    // it means the VBLANK didn't fire before the next frame started.
+    if (g_state.swap_pending && g_state.in_frame) {
+        if (g_state.missed_frames < 255u) g_state.missed_frames++;
+    }
+
+    // Reset per-frame stats accumulators
+    g_state.ring_peak_pct = 0;
+    g_state.in_frame      = true;
+
+    if (g_state.frame_stats_enabled) {
+        g_state.frame_start_us = time_us_64();
+    }
+    coprocessor_set_error(ERR_OK);
+}
+
+static void handle_end_frame(void) {
+    // Compute render time
+    if (g_state.frame_stats_enabled && g_state.in_frame) {
+        uint64_t delta_us  = time_us_64() - g_state.frame_start_us;
+        g_state.last_render_ms = (uint16_t)(delta_us / 1000u);
+    }
+
+    // Increment frame counter
+    g_state.frame_count++;
+
+    // Double-buffer: schedule VBLANK swap (same as SWAP_BUFFERS)
+    if (g_fb_back && g_fb_back != g_fb_front) {
+        g_state.swap_pending = true;
+    }
+
+    // Push EVT_FRAME_COMPLETE to event buffer
+    event_buffer_push(EVT_FRAME_COMPLETE, g_state.frame_count);
+
+    g_state.in_frame = false;
     coprocessor_set_error(ERR_OK);
 }
 
@@ -303,6 +419,12 @@ void dispatch_command(uint8_t opcode, const uint8_t *payload, uint16_t len) {
         case OP_ENABLE_FRAME_STATS: handle_enable_frame_stats(payload, len);     return;
         case OP_SWAP_BUFFERS:       handle_swap_buffers();                       return;
         case OP_SWAP_BUFFERS_IMM:   handle_swap_buffers_immediate();             return;
+        // Phase 2 drawing-state commands (require ACTIVE but not framebuffer)
+        case OP_PUSH_CLIP_RECT:     handle_push_clip_rect(payload, len);         return;
+        case OP_POP_CLIP_RECT:      handle_pop_clip_rect();                      return;
+        case OP_SET_PIXEL_FORMAT:   handle_set_pixel_format(payload, len);       return;
+        case OP_BEGIN_FRAME:        handle_begin_frame();                        return;
+        case OP_END_FRAME:          handle_end_frame();                          return;
         default: break;
     }
 
@@ -322,15 +444,13 @@ void dispatch_command(uint8_t opcode, const uint8_t *payload, uint16_t len) {
         case OP_RENDER_TEXT:        handle_render_text(payload, len);            return;
         case OP_UPLOAD_VRAM:        handle_upload_vram(payload, len);            return;
 
-        // Stubs for Phase 2+ opcodes — return ERR_FEATURE_UNAVAILABLE
+        // Remaining Phase 2+ stubs — return ERR_FEATURE_UNAVAILABLE
         case OP_COPY_REGION:
         case OP_REPLACE_COLOR:
         case OP_SCROLL_SCREEN:
         case OP_DRAW_TILEMAP:
         case OP_DRAW_9PATCH:
         case OP_CAPTURE_REGION:
-        case OP_PUSH_CLIP_RECT:
-        case OP_POP_CLIP_RECT:
         case OP_BEGIN_DISPLAY_LIST:
         case OP_END_DISPLAY_LIST:
         case OP_EXEC_DISPLAY_LIST:
@@ -342,9 +462,6 @@ void dispatch_command(uint8_t opcode, const uint8_t *payload, uint16_t len) {
         case OP_VM_RESET:
         case OP_SCHEDULE_PROCEDURE:
         case OP_UNSCHEDULE_PROCEDURE:
-        case OP_BEGIN_FRAME:
-        case OP_END_FRAME:
-        case OP_SET_PIXEL_FORMAT:
         case OP_SET_VM_MODE:
             coprocessor_set_error(ERR_FEATURE_UNAVAILABLE);
             return;

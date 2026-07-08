@@ -220,3 +220,61 @@ void display_rp2350_swap_buffers(void) {
 void display_rp2350_core1_entry(void) {
     video_output_core1_run();
 }
+
+// =============================================================================
+// display_rp2350_set_pixel_format — live pixel format switch (SET_PIXEL_FORMAT 0x14)
+// Maps format_enum (PIXEL_FORMAT_* from opcodes.h) to HSTX expand_tmds /
+// expand_shift register pairs defined in pico_hdmi/pixel_formats.h.
+// Only expand_tmds and expand_shift change; PLL, framebuffer, and mode are untouched.
+// =============================================================================
+bool display_rp2350_set_pixel_format(uint8_t format_enum) {
+    uint32_t expand_tmds, expand_shift;
+
+    switch (format_enum) {
+        // ── 8bpp ──────────────────────────────────────────────────────────
+        case 0x00: // PIXEL_FORMAT_RGB332
+            expand_tmds  = HSTX_EXPAND_TMDS_RGB332;
+            expand_shift = HSTX_EXPAND_SHIFT_8BPP;
+            break;
+        case 0x01: // PIXEL_FORMAT_MONO8 (greyscale)
+            expand_tmds  = HSTX_EXPAND_TMDS_MONO8;
+            expand_shift = HSTX_EXPAND_SHIFT_8BPP;
+            break;
+        case 0x02: // PIXEL_FORMAT_INDEX8 (palette; framebuffer stores palette index)
+            // No separate HSTX constant — rendered identically to RGB332 for now.
+            // The palette lookup is a Phase 3 concern (LUT in scanline callback).
+            expand_tmds  = HSTX_EXPAND_TMDS_RGB332;
+            expand_shift = HSTX_EXPAND_SHIFT_8BPP;
+            break;
+        // ── 16bpp ─────────────────────────────────────────────────────────
+        case 0x10: // PIXEL_FORMAT_RGB565
+            expand_tmds  = HSTX_EXPAND_TMDS_RGB565;
+            expand_shift = HSTX_EXPAND_SHIFT_16BPP;
+            break;
+        // ── 4bpp ──────────────────────────────────────────────────────────
+        case 0x20: // PIXEL_FORMAT_RGB121
+            expand_tmds  = HSTX_EXPAND_TMDS_RGB121;
+            expand_shift = HSTX_EXPAND_SHIFT_4BPP;
+            break;
+        case 0x21: // PIXEL_FORMAT_MONO4 — greyscale nibble; reuse MONO8 expand + 4bpp shift
+            expand_tmds  = HSTX_EXPAND_TMDS_MONO8;
+            expand_shift = HSTX_EXPAND_SHIFT_4BPP;
+            break;
+        case 0x22: // PIXEL_FORMAT_INDEX4 — same HSTX layout as RGB121 (Phase 3 palette)
+            expand_tmds  = HSTX_EXPAND_TMDS_RGB121;
+            expand_shift = HSTX_EXPAND_SHIFT_4BPP;
+            break;
+        // ── 24bpp ─────────────────────────────────────────────────────────
+        case 0x30: // PIXEL_FORMAT_RGB888
+            expand_tmds  = HSTX_EXPAND_TMDS_RGB888;
+            expand_shift = HSTX_EXPAND_SHIFT_24BPP;
+            break;
+        default:
+            return false;  // unknown format; caller sets ERR_INVALID_PARAM
+    }
+
+    video_output_set_pixel_format(expand_tmds, expand_shift);
+    // Update scanline bytes-per-pixel if format size changed
+    s_bytes_per_px = (format_enum == 0x10) ? 2u : 1u;   // 16bpp=2, everything else=1
+    return true;
+}

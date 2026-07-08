@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>   // for size_t (used by event drain)
 
 // =============================================================================
 // Coprocessor State (spec §3)
@@ -25,10 +26,13 @@ typedef struct {
     uint16_t    chroma_key_color;    // RGB565; default 0xF81F (magenta)
     bool        frame_stats_enabled; // false at boot
     bool        swap_pending;        // SWAP_BUFFERS deferred to VBLANK
-    uint32_t    frame_count;         // incremented each VBLANK
-    uint16_t    last_render_ms;      // frame render time (Phase 2)
-    uint8_t     ring_peak_pct;       // ring buffer peak % this frame
-    uint8_t     missed_frames;       // frames where swap was missed
+    uint32_t    frame_count;         // incremented each END_FRAME
+    uint16_t    last_render_ms;      // frame render time in ms (Phase 2)
+    uint8_t     ring_peak_pct;       // peak ring-buffer fill % since last BEGIN_FRAME
+    uint8_t     missed_frames;       // count of frames where swap was not consumed by VBLANK
+    // Phase 2 frame timing
+    uint64_t    frame_start_us;      // time_us_64() captured at BEGIN_FRAME
+    bool        in_frame;            // true between BEGIN_FRAME and END_FRAME
 } gpu_state_t;
 
 extern gpu_state_t g_state;

@@ -182,6 +182,13 @@ int main(void) {
         // Drain complete validated packets from the ring buffer
         packets_process();
 
+        // Track peak ring-buffer fill for GET_FRAME_STATS (spec §5.5)
+        {
+            uint32_t avail = rb_available();
+            uint8_t  pct   = (uint8_t)((avail * 100u) / RING_BUFFER_SIZE);
+            if (pct > g_state.ring_peak_pct) g_state.ring_peak_pct = pct;
+        }
+
         // Send any queued query response back to host over MISO
         uint32_t resp_len;
         const uint8_t *resp = dispatch_get_response(&resp_len);

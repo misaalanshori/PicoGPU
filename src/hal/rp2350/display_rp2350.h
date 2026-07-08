@@ -29,3 +29,8 @@ void display_rp2350_swap_buffers(void);
 // Core 1 entry point — runs pico_hdmi polling loop. Never returns.
 void display_rp2350_core1_entry(void);
 
+// Switch pixel format within the active profile's bpp_class.
+// Writes expand_tmds and expand_shift HSTX registers via video_output_set_pixel_format().
+// Does NOT touch PLLs, framebuffer pointers, or scanout resolution.
+// Returns false if format_enum has no known HSTX constants (ERR_UNSUPPORTED).
+bool display_rp2350_set_pixel_format(uint8_t format_enum);

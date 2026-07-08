@@ -1,6 +1,6 @@
 #pragma once
-// effects.h — Phase 1 pixel-write helper (chroma key + direct write)
-// Phase 2 will add: dithering, blend modes, scissor clipping.
+// effects.h — Pixel-write helpers (Phase 2: dithering, blend modes, scissor clipping active)
+// All drawing calls flow through effect_write_pixel(); effect_fill_hspan() for solid spans.
 
 #include <stdint.h>
 #include "framebuffer.h"
