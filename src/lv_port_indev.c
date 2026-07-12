@@ -36,13 +36,8 @@ bool lv_port_indev_is_button_pressed(void) {
 // LVGL read callback
 static void button_read(lv_indev_t *indev, lv_indev_data_t *data) {
     (void)indev;
-    
-    if (lv_port_indev_is_button_pressed()) {
-        data->key = LV_KEY_NEXT;
-        data->state = LV_INDEV_STATE_PRESSED;
-    } else {
-        data->state = LV_INDEV_STATE_RELEASED;
-    }
+    // Handled in main.c loop using precise press durations and groups
+    data->state = LV_INDEV_STATE_RELEASED;
 }
 
 void lv_port_indev_init(void) {
@@ -51,8 +46,13 @@ void lv_port_indev_init(void) {
     gpio_set_dir(BUTTON_PIN, GPIO_IN);
     gpio_pull_up(BUTTON_PIN);
 
+    // Create default group
+    lv_group_t *g = lv_group_create();
+    lv_group_set_default(g);
+
     // Register button in LVGL as a keypad navigation device
     lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_KEYPAD);
     lv_indev_set_read_cb(indev, button_read);
+    lv_indev_set_group(indev, g);
 }

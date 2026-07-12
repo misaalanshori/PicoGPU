@@ -208,6 +208,13 @@ void build_ui(void) {
         lv_slider_set_value(slider, 50, LV_ANIM_OFF);
     }
 
+    // Add interactive widgets to group for keypad navigation
+    lv_group_t *g = lv_group_get_default();
+    if (g) {
+        if (btn_theme) lv_group_add_obj(g, btn_theme);
+        if (slider) lv_group_add_obj(g, slider);
+    }
+
     // ==========================================
     // Tab 3: System Specs
     // ==========================================
@@ -225,12 +232,12 @@ void build_ui(void) {
     // Info Labels
     lv_obj_t *lbl_mcu = lv_label_create(tab3);
     if (lbl_mcu) {
-        lv_label_set_text(lbl_mcu, "MCU: Raspberry Pi RP2350 @ 372 MHz");
+        lv_label_set_text(lbl_mcu, "MCU: Raspberry Pi RP2350 @ 252 MHz");
     }
 
     lv_obj_t *lbl_signal = lv_label_create(tab3);
     if (lbl_signal) {
-        lv_label_set_text(lbl_signal, "Output: 1280x720 HDMI (640x360 Scaled 2x)");
+        lv_label_set_text(lbl_signal, "Output: 640x480 HDMI (640x360 Centered)");
     }
 
     lbl_stats_heap = lv_label_create(tab3);
@@ -320,16 +327,67 @@ void real_main(void) {
         // Increment LVGL ticks (handled by custom callback)
         lv_timer_handler();
 
-        // Check for button press on GPIO 23 to switch tabs
+        // Check for single-button gestures on GPIO 23:
+        // - Long Press (held >= 800ms) -> Switch active tabs
+        // - Double Click (< 350ms interval) -> Focus next widget in group
+        // - Single Click (duration < 800ms, no double click) -> Send Enter (click currently focused widget)
+        static uint32_t press_start_time = 0;
+        static bool waiting_for_double_click = false;
+        static uint32_t last_click_time = 0;
+        static bool button_processed = false;
+
         bool btn_pressed = lv_port_indev_is_button_pressed();
+
         if (btn_pressed && !last_btn_state) {
-            static int active_tab = 0;
-            active_tab = (active_tab + 1) % 3;
-            if (tabview) {
-                lv_tabview_set_active(tabview, active_tab, LV_ANIM_ON);
-            }
-            printf("[main] GPIO 23 button press detected! Switching to tab %d \r\n", active_tab);
+            press_start_time = time_us_32() / 1000;
+            button_processed = false;
         }
+
+        if (btn_pressed && !button_processed) {
+            uint32_t current_time = time_us_32() / 1000;
+            if (current_time - press_start_time >= 800) {
+                // Long press detected! Switch tabs
+                static int active_tab = 0;
+                active_tab = (active_tab + 1) % 3;
+                if (tabview) {
+                    lv_tabview_set_active(tabview, active_tab, LV_ANIM_ON);
+                }
+                printf("[main] Long press detected! Switching to tab %d \r\n", active_tab);
+                button_processed = true;
+            }
+        }
+
+        if (!btn_pressed && last_btn_state) {
+            uint32_t release_time = time_us_32() / 1000;
+            if (!button_processed) {
+                uint32_t duration = release_time - press_start_time;
+                if (duration < 800) {
+                    if (release_time - last_click_time < 350) {
+                        // Double click detected! Move focus to next widget
+                        lv_group_focus_next(lv_group_get_default());
+                        printf("[main] Double click! Focus moved to next widget.\r\n");
+                        waiting_for_double_click = false;
+                    } else {
+                        waiting_for_double_click = true;
+                    }
+                    last_click_time = release_time;
+                }
+            }
+        }
+
+        if (waiting_for_double_click) {
+            uint32_t current_time = time_us_32() / 1000;
+            if (current_time - last_click_time >= 350) {
+                // Single click detected! Send LV_EVENT_CLICKED directly to focused widget
+                lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
+                if (focused) {
+                    lv_obj_send_event(focused, LV_EVENT_CLICKED, NULL);
+                    printf("[main] Single click! Sent LV_EVENT_CLICKED to focused widget.\r\n");
+                }
+                waiting_for_double_click = false;
+            }
+        }
+
         last_btn_state = btn_pressed;
 
         // Perform frame-level melody updates
