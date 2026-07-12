@@ -250,9 +250,9 @@ void static inline show_fps() {
     hagl_put_text(display, message, 4, display->height - 14, green, font6x9);
 
     /* Print the message on lower right corner. */
-    swprintf(message, sizeof(message), L"%.*f KBPS  ", 0, bps.current / 1024);
+    swprintf(message, sizeof(message), L"@adminispwd, misa.pw", 0);
     hagl_put_text(
-        display, message, display->width - 60, display->height - 14, green, font6x9
+        display, message, display->width - 130, display->height - 14, green, font6x9
     );
 
     /* Set clip window back to smaller so effects do not mess the messages. */

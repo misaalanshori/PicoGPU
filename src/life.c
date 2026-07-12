@@ -45,6 +45,10 @@ void life_animate(hagl_backend_t const *display) {
         return;
     }
 
+    // Split the 320x160 grid into a 4x4 array of chunks (each chunk is 80x40 cells)
+    int chunk_alive[16] = {0};
+    int chunk_diff[16] = {0};
+
     // Toroidal wrap simulation step
     for (int y = 0; y < GRID_HEIGHT; y++) {
         int prev_y = (y == 0) ? (GRID_HEIGHT - 1) : (y - 1);
@@ -54,6 +58,8 @@ void life_animate(hagl_backend_t const *display) {
         uint8_t *row_prev = &current_grid[prev_y * GRID_WIDTH];
         uint8_t *row_next = &current_grid[next_y * GRID_WIDTH];
         uint8_t *row_dest = &next_grid[y * GRID_WIDTH];
+
+        int chunk_y_idx = y / 40;
 
         for (int x = 0; x < GRID_WIDTH; x++) {
             int prev_x = (x == 0) ? (GRID_WIDTH - 1) : (x - 1);
@@ -65,19 +71,101 @@ void life_animate(hagl_backend_t const *display) {
                             (row_next[prev_x] > 0) + (row_next[x] > 0) + (row_next[next_x] > 0);
 
             uint8_t val = row_curr[x];
+            uint8_t next_val = 0;
             if (val > 0) {
                 // Survival rules
                 if (neighbors == 2 || neighbors == 3) {
-                    row_dest[x] = (val < 9) ? (val + 1) : 9; // Survived: Age increments
+                    next_val = (val < 9) ? (val + 1) : 9; // Survived: Age increments
                 } else {
-                    row_dest[x] = 0; // Death: Under/Over-population
+                    next_val = 0; // Death: Under/Over-population
                 }
             } else {
                 // Birth rule
                 if (neighbors == 3) {
-                    row_dest[x] = 1; // Born
+                    next_val = 1; // Born
                 } else {
-                    row_dest[x] = 0;
+                    next_val = 0;
+                }
+            }
+
+            int chunk_x_idx = x / 80;
+            int chunk_idx = chunk_y_idx * 4 + chunk_x_idx;
+
+            // Compare next_val with two frames ago (stored in row_dest[x] before overwrite)
+            if ((next_val > 0) != (row_dest[x] > 0)) {
+                chunk_diff[chunk_idx]++;
+            }
+
+            row_dest[x] = next_val;
+
+            if (next_val > 0) {
+                chunk_alive[chunk_idx]++;
+            }
+        }
+    }
+
+    // Process inactivity and revive on a per-chunk basis
+    for (int cy_chunk = 0; cy_chunk < 4; cy_chunk++) {
+        for (int cx_chunk = 0; cx_chunk < 4; cx_chunk++) {
+            int chunk_idx = cy_chunk * 4 + cx_chunk;
+
+            // Thresholds: less than 25 alive cells, or less than 2 differences (static/oscillating)
+            if (chunk_alive[chunk_idx] < 25 || chunk_diff[chunk_idx] < 2) {
+                int start_x = cx_chunk * 80;
+                int end_x = start_x + 80;
+                int start_y = cy_chunk * 40;
+                int end_y = start_y + 40;
+
+                // Collect old cells (age >= 6) locally inside this chunk
+                int old_cell_x[32];
+                int old_cell_y[32];
+                int old_cell_count = 0;
+
+                for (int y = start_y; y < end_y && old_cell_count < 32; y++) {
+                    uint8_t *row_dest = &next_grid[y * GRID_WIDTH];
+                    for (int x = start_x; x < end_x && old_cell_count < 32; x++) {
+                        if (row_dest[x] >= 6) {
+                            old_cell_x[old_cell_count] = x;
+                            old_cell_y[old_cell_count] = y;
+                            old_cell_count++;
+                        }
+                    }
+                }
+
+                if (old_cell_count > 0) {
+                    // Revive a 7x7 neighborhood around up to 2 old survivors in the chunk
+                    int groups = (old_cell_count > 2) ? 2 : old_cell_count;
+                    for (int g = 0; g < groups; g++) {
+                        int target_idx = rand() % old_cell_count;
+                        int ox = old_cell_x[target_idx];
+                        int oy = old_cell_y[target_idx];
+
+                        for (int dy = -3; dy <= 3; dy++) {
+                            int ry = (oy + dy + GRID_HEIGHT) % GRID_HEIGHT;
+                            uint8_t *row_dest = &next_grid[ry * GRID_WIDTH];
+                            for (int dx = -3; dx <= 3; dx++) {
+                                int rx = (ox + dx + GRID_WIDTH) % GRID_WIDTH;
+                                if (rand() % 100 < 35) {
+                                    row_dest[rx] = 1;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // If the chunk is completely dead, drop a random 5x5 spark inside it
+                    int sx = start_x + 10 + (rand() % 60);
+                    int sy = start_y + 10 + (rand() % 20);
+
+                    for (int dy = -2; dy <= 2; dy++) {
+                        int ry = (sy + dy + GRID_HEIGHT) % GRID_HEIGHT;
+                        uint8_t *row_dest = &next_grid[ry * GRID_WIDTH];
+                        for (int dx = -2; dx <= 2; dx++) {
+                            int rx = (sx + dx + GRID_WIDTH) % GRID_WIDTH;
+                            if (rand() % 100 < 40) {
+                                row_dest[rx] = 1;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -94,27 +182,22 @@ void life_render(hagl_backend_t const *display) {
         return;
     }
 
-    // Clear active area to black using fast 32-bit aligned memset
-    memset(&active_buffer[20 * DISPLAY_WIDTH], 0, DISPLAY_WIDTH * (display->height - 40) * sizeof(hagl_color_t));
-
-    // Render active cells
+    // No screen-wide memset/clear to prevent flickering in single-buffered setup.
+    // Instead, overwrite every single cell directly (dead cells are drawn in black).
     for (int cy = 0; cy < GRID_HEIGHT; cy++) {
         uint32_t row0_offset = (20 + cy * 2) * DISPLAY_WIDTH;
         uint32_t row1_offset = row0_offset + DISPLAY_WIDTH;
         uint8_t *row_ptr = &current_grid[cy * GRID_WIDTH];
 
         for (int cx = 0; cx < GRID_WIDTH; cx++) {
-            uint8_t val = row_ptr[cx];
-            if (val > 0) {
-                hagl_color_t color = color_palette[val];
-                uint32_t x_offset = cx * 2;
+            hagl_color_t color = color_palette[row_ptr[cx]];
+            uint32_t x_offset = cx * 2;
 
-                // Write 2x2 pixel block directly to framebuffer
-                active_buffer[row0_offset + x_offset] = color;
-                active_buffer[row0_offset + x_offset + 1] = color;
-                active_buffer[row1_offset + x_offset] = color;
-                active_buffer[row1_offset + x_offset + 1] = color;
-            }
+            // Write 2x2 pixel block directly to framebuffer
+            active_buffer[row0_offset + x_offset] = color;
+            active_buffer[row0_offset + x_offset + 1] = color;
+            active_buffer[row1_offset + x_offset] = color;
+            active_buffer[row1_offset + x_offset + 1] = color;
         }
     }
 }
