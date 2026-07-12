@@ -70,11 +70,11 @@ void rotozoom_render(hagl_backend_t const *display) {
     float s, c, z;
     size_t cs = sizeof(hagl_color_t);
 
-    s = sin(angle * M_PI / 180);
-    c = cos(angle * M_PI / 180);
+    s = sinf(angle * (float)M_PI / 180.0f);
+    c = cosf(angle * (float)M_PI / 180.0f);
     // s = sinlut[angle];
     // c = coslut[angle];
-    z = s * 1.2;
+    z = s * 1.2f;
 
     for (uint16_t x = 0; x < display->width; x = x + PIXEL_SIZE) {
         for (uint16_t y = 0; y < display->height; y = y + PIXEL_SIZE) {

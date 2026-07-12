@@ -70,7 +70,7 @@ static int melody_index = 0;
 static int note_frames_remaining = 0;
 
 // From pico_effects
-static uint8_t effect = 1;
+static uint8_t effect = 3;
 volatile bool fps_flag = false;
 volatile bool switch_flag = true;
 static fps_instance_t fps;
@@ -143,7 +143,9 @@ static void generate_audio(void)
 
         hstx_data_island_t island;
         hstx_encode_data_island(&island, &packet, false, DI_HSYNC_ACTIVE);
-        hstx_di_queue_push(&island);
+        if (!hstx_di_queue_push(&island)) {
+            break;
+        }
     }
 }
 
@@ -246,6 +248,11 @@ void static inline show_fps() {
 // ============================================================================
 int main(void)
 {
+    // Immediate LED initialization to debug boot success
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, true);
+
     // 720p60: 372 MHz at 1.3V. Closest achievable to 371.25 MHz with 12 MHz XOSC
     // (0.2% high -> 74.4 MHz pixel clock, within HDMI tolerance for 720p60).
     // vreg_set_voltage(VREG_VOLTAGE_1_30);
@@ -295,6 +302,10 @@ int main(void)
 
     sleep_ms(2500);
 
+    
+
+    printf("[main] stdio inited \r\n");
+
     // From pico_effects
     size_t bytes = 0;
     struct repeating_timer switch_timer;
@@ -306,9 +317,12 @@ int main(void)
     fps_init(&fps);
 
     display = hagl_init();
+    printf("[main] display inited \r\n");
+    
 
     hagl_clear(display);
     hagl_set_clip(display, 0, 20, display->width - 1, display->height - 21);
+    
 
     /* Change demo every 10 seconds. */
     add_repeating_timer_ms(5000, switch_timer_callback, NULL, &switch_timer);
@@ -316,6 +330,7 @@ int main(void)
     /* Update displayed FPS counter every 250 ms. */
     add_repeating_timer_ms(250, show_timer_callback, NULL, &show_timer);
 
+    printf("[main] timer inited \r\n");
 
     init_sine_table();
     note_frames_remaining = current_melody[0].duration;
@@ -328,6 +343,7 @@ int main(void)
     uint32_t last_frame = 0;
     bool led_state = false;
 
+    printf("[main] loop starting \r\n");
     while (1) {
         // Keep audio buffer fed
         generate_audio();

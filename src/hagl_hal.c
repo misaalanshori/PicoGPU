@@ -5,54 +5,35 @@
 
 #include "pico_hdmi/hstx_data_island_queue.h"
 #include "pico_hdmi/hstx_packet.h"
+#include "pico_hdmi/pixel_formats.h"
 #include "pico_hdmi/video_output.h" // for DI_HSYNC_ACTIVE
 #include "pico_hdmi/video_output_rt.h"
 
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 
+#include <stdlib.h>
+
 #define BUFFER_SIZE    (DISPLAY_WIDTH * DISPLAY_HEIGHT)
 
-// Allocate the double buffers
-static hagl_color_t buffer_a[BUFFER_SIZE];
-static hagl_color_t buffer_b[BUFFER_SIZE];
+// Allocate the single framebuffer pointer dynamically
+static hagl_color_t *framebuffer = NULL;
 
-static uint32_t color_cache[256];
-
-// Pointers to manage the double buffering state
-static hagl_color_t *active_buffer = buffer_a; // Where HAGL draws
-static hagl_color_t *front_buffer = buffer_b;  // What is currently on the screen
-
-uint16_t rgb332_to_rgb565_accurate(uint8_t rgb332) {
-    // 1. Extract the individual RGB channels
-    uint8_t r = (rgb332 >> 5) & 0x07; // Top 3 bits
-    uint8_t g = (rgb332 >> 2) & 0x07; // Middle 3 bits
-    uint8_t b = rgb332 & 0x03;        // Bottom 2 bits
-
-    // 2. Expand them to fill the 5-bit and 6-bit spaces
-    // Red: 3 bits to 5 bits (Copy the RRR bits, then append the top 2 R bits)
-    uint16_t r5 = (r << 2) | (r >> 1);
-    
-    // Green: 3 bits to 6 bits (Perfectly copy GGG twice -> GGGGGG)
-    uint16_t g6 = (g << 3) | g;
-    
-    // Blue: 2 bits to 5 bits (Copy BB, then BB, then top B -> BBBBB)
-    uint16_t b5 = (b << 3) | (b << 1) | (b >> 1);
-
-    // 3. Shift into the final RGB565 positions and combine
-    return (r5 << 11) | (g6 << 5) | b5;
-}
+// Pointers to manage the single buffering state
+static hagl_color_t *active_buffer = NULL; // Where HAGL draws
+static hagl_color_t *front_buffer = NULL;  // What is currently on the screen
 
 static void __scratch_x("") scanline_callback(uint32_t v_scanline, uint32_t active_line, uint32_t *dst) {
     (void)v_scanline;
 
-    int fb_line = active_line/4;
+    int fb_line = active_line / 2; // 2x vertical scale
     int pixel_zero = fb_line * DISPLAY_WIDTH;
+    uint8_t *dst8 = (uint8_t *)dst;
 
     for (int x = 0; x < DISPLAY_WIDTH; x++) {
-        uint32_t packed = color_cache[front_buffer[pixel_zero + x]];
-        dst[x * 2]     = packed;
-        dst[x * 2 + 1] = packed;
+        uint8_t pixel = front_buffer[pixel_zero + x];
+        dst8[x * 2]     = pixel;
+        dst8[x * 2 + 1] = pixel;
     }
 }
 
@@ -69,13 +50,7 @@ static void put_pixel(void *self, int16_t x0, int16_t y0, hagl_color_t color)
 
 static size_t flush(void *self)
 {
-    // Swap the pointers
-    uint8_t *temp = active_buffer;
-    active_buffer = front_buffer;
-    front_buffer = temp;
-
-    // Optional: Clear the new active buffer so you start the next frame with a blank slate
-    // memset(active_buffer, 0, BUFFER_SIZE);
+    // No-op for single buffering
     return BUFFER_SIZE;
 }
 
@@ -90,18 +65,22 @@ static hagl_color_t color(void *self, uint8_t r, uint8_t g, uint8_t b) {
 
 void hagl_hal_init(hagl_backend_t *backend)
 {
-    for (int i = 0; i < 256; i++) {
-        uint16_t color = rgb332_to_rgb565_accurate(i);
-        color_cache[i] = (uint32_t)color | ((uint32_t)color << 16);
-    }
+    // Allocate framebuffer dynamically
+    framebuffer = malloc(BUFFER_SIZE);
+    active_buffer = framebuffer;
+    front_buffer = framebuffer;
 
     // Initialize HDMI output — rt variant
     hstx_di_queue_init();
     video_output_set_mode(&video_mode_720_p);
-    video_output_init(DISPLAY_WIDTH*4, DISPLAY_HEIGHT*4);
+    video_output_init(DISPLAY_WIDTH * 2, DISPLAY_HEIGHT * 2);
 
     // Register scanline callback
     video_output_set_scanline_callback(scanline_callback);
+
+    // Set pixel format to 8bpp RGB332 with hardware expansion BEFORE Core 1 is launched
+    // to ensure the DMA and HSTX start in the correct mode from the first frame.
+    video_output_set_pixel_format(HSTX_EXPAND_TMDS_RGB332, HSTX_EXPAND_SHIFT_8BPP);
 
     // Launch Core 1 for HSTX output
     multicore_launch_core1(video_output_core1_run);

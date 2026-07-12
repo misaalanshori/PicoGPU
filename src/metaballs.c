@@ -96,7 +96,11 @@ void metaballs_render(hagl_backend_t const *display) {
                 const float dx = x - balls[i].position.x;
                 const float dy = y - balls[i].position.y;
                 const float d2 = dx * dx + dy * dy;
-                sum += balls[i].radius * balls[i].radius / d2;
+                if (d2 > 0.0f) {
+                    sum += balls[i].radius * balls[i].radius / d2;
+                } else {
+                    sum += 1000.0f;
+                }
                 // sum += balls[i].radius / sqrt(d2);
             }
 

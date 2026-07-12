@@ -39,8 +39,12 @@ static const uint8_t SPEED = 4;
 static const uint8_t PIXEL_SIZE = 2;
 
 void plasma_init(hagl_backend_t const *display) {
-    uint8_t *ptr = plasma = malloc(display->width * display->height * sizeof(uint8_t));
+    size_t plasma_size = (display->width / PIXEL_SIZE) * (display->height / PIXEL_SIZE);
+    uint8_t *ptr = plasma = malloc(plasma_size * sizeof(uint8_t));
     palette = malloc(256 * sizeof(hagl_color_t));
+    if (plasma == NULL || palette == NULL) {
+        return;
+    }
 
     /* Generate nice continous palette. */
     for (uint16_t i = 0; i < 256; i++) {
@@ -65,6 +69,9 @@ void plasma_init(hagl_backend_t const *display) {
 }
 
 void plasma_render(hagl_backend_t const *display) {
+    if (plasma == NULL || palette == NULL) {
+        return;
+    }
     uint8_t *ptr = plasma;
 
     for (uint16_t y = 0; y < display->height; y += PIXEL_SIZE) {

@@ -37,14 +37,18 @@ SPDX-License-Identifier: MIT-0
 #include "head.h"
 
 static const uint8_t SPEED = 2;
-static const uint8_t PIXEL_SIZE = 1;
+static const uint8_t PIXEL_SIZE = 2;
 static uint32_t frame;
 
 int8_t *lut;
 
 void deform_init(hagl_backend_t const *display) {
     /* Allocate memory for lut and store address also to ptr. */
-    int8_t *ptr = lut = malloc(display->height * display->width * 2 * sizeof(int8_t));
+    size_t lut_size = (display->width / PIXEL_SIZE) * (display->height / PIXEL_SIZE) * 2;
+    int8_t *ptr = lut = malloc(lut_size * sizeof(int8_t));
+    if (lut == NULL) {
+        return;
+    }
 
     for (uint16_t j = 0; j < display->height; j += PIXEL_SIZE) {
         for (uint16_t i = 0; i < display->width; i += PIXEL_SIZE) {
@@ -95,6 +99,9 @@ void deform_init(hagl_backend_t const *display) {
 }
 
 void deform_render(hagl_backend_t const *display) {
+    if (lut == NULL) {
+        return;
+    }
     int8_t *ptr = lut;
     size_t cs = sizeof(hagl_color_t);
 
