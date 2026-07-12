@@ -57,7 +57,75 @@ static void advance_melody(void) {
     }
 }
 
+typedef enum {
+    SFX_NONE,
+    SFX_FLAP,
+    SFX_POINT,
+    SFX_CRASH
+} sfx_type_t;
+
+static volatile sfx_type_t current_sfx = SFX_NONE;
+static volatile int sfx_frame = 0;
+
+// Flappy Bird Game Variables
+static bool game_active = false;
+static bool game_over = false;
+static float bird_y = 120.0f;
+static float bird_velocity = 0.0f;
+static float pipe_x = 640.0f;
+static float pipe_gap_y = 140.0f;
+static int score = 0;
+static int high_score = 0;
+
+#define BIRD_X 100
+#define BIRD_SIZE 16
+#define PIPE_WIDTH 50
+#define GAP_SIZE 100
+#define GAME_HEIGHT 280
+#define GAME_WIDTH 640
+#define GRAVITY 0.35f
+#define FLAP_IMPULSE -5.5f
+#define PIPE_SPEED 3.0f
+
+static lv_obj_t *game_area = NULL;
+static lv_obj_t *bird_obj = NULL;
+static lv_obj_t *pipe_top = NULL;
+static lv_obj_t *pipe_bottom = NULL;
+static lv_obj_t *lbl_score = NULL;
+static lv_obj_t *lbl_status = NULL;
+static lv_obj_t *tab4 = NULL;
+
 static inline int16_t get_sine_sample(void) {
+    uint32_t sfx_phase_inc = 0;
+    
+    if (current_sfx != SFX_NONE) {
+        uint32_t sfx_freq = 0;
+        if (current_sfx == SFX_FLAP) {
+            // Ascending flap sweep
+            sfx_freq = 200 + sfx_frame * 80; // 200 to 600 Hz
+            sfx_frame++;
+            if (sfx_frame > 5) current_sfx = SFX_NONE;
+        } else if (current_sfx == SFX_POINT) {
+            // High point chime
+            sfx_freq = (sfx_frame < 5) ? 880 : 1046;
+            sfx_frame++;
+            if (sfx_frame > 10) current_sfx = SFX_NONE;
+        } else if (current_sfx == SFX_CRASH) {
+            // Descending buzz
+            sfx_freq = 150 - sfx_frame * 7;
+            if (sfx_freq < 40) sfx_freq = 40;
+            sfx_frame++;
+            if (sfx_frame > 15) current_sfx = SFX_NONE;
+        }
+        
+        sfx_phase_inc = (uint32_t)(((uint64_t)sfx_freq << 32) / AUDIO_SAMPLE_RATE);
+        static uint32_t sfx_phase = 0;
+        int16_t s = sine_table[(sfx_phase >> 24) & 0xFF];
+        sfx_phase += sfx_phase_inc;
+        return s;
+    }
+
+    // Fallback to background melody if no SFX is active
     if (phase_increment == 0) return 0;
     int16_t s = sine_table[(audio_phase >> 24) & 0xFF];
     audio_phase += phase_increment;
@@ -134,8 +202,9 @@ void build_ui(void) {
     lv_obj_t *tab1 = lv_tabview_add_tab(tabview, "Dashboard");
     lv_obj_t *tab2 = lv_tabview_add_tab(tabview, "Controls");
     lv_obj_t *tab3 = lv_tabview_add_tab(tabview, "System");
+    tab4 = lv_tabview_add_tab(tabview, "Game");
 
-    if (tab1 == NULL || tab2 == NULL || tab3 == NULL) {
+    if (tab1 == NULL || tab2 == NULL || tab3 == NULL || tab4 == NULL) {
         printf("[main] ERROR: Failed to create one of the tabs!\r\n");
         return;
     }
@@ -243,6 +312,71 @@ void build_ui(void) {
     lbl_stats_heap = lv_label_create(tab3);
     lbl_stats_resync = lv_label_create(tab3);
     lbl_stats_frame = lv_label_create(tab3);
+
+    // ==========================================
+    // Tab 4: Flappy Bird Game
+    // ==========================================
+    lv_obj_remove_flag(tab4, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(tab4, 0, 0);
+
+    // Game Area Container
+    game_area = lv_obj_create(tab4);
+    if (game_area) {
+        lv_obj_set_size(game_area, GAME_WIDTH, GAME_HEIGHT);
+        lv_obj_align(game_area, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_bg_color(game_area, lv_color_hex(0x101010), 0); // Dark background
+        lv_obj_set_style_bg_opa(game_area, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(game_area, 0, 0);
+        lv_obj_set_style_pad_all(game_area, 0, 0);
+        lv_obj_remove_flag(game_area, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Green pipes (top and bottom)
+        pipe_top = lv_obj_create(game_area);
+        if (pipe_top) {
+            lv_obj_set_style_bg_color(pipe_top, lv_palette_main(LV_PALETTE_GREEN), 0);
+            lv_obj_set_style_bg_opa(pipe_top, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(pipe_top, 0, 0);
+            lv_obj_set_size(pipe_top, PIPE_WIDTH, 100);
+            lv_obj_set_pos(pipe_top, (int)pipe_x, 0);
+        }
+
+        pipe_bottom = lv_obj_create(game_area);
+        if (pipe_bottom) {
+            lv_obj_set_style_bg_color(pipe_bottom, lv_palette_main(LV_PALETTE_GREEN), 0);
+            lv_obj_set_style_bg_opa(pipe_bottom, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(pipe_bottom, 0, 0);
+            lv_obj_set_size(pipe_bottom, PIPE_WIDTH, 100);
+            lv_obj_set_pos(pipe_bottom, (int)pipe_x, (int)(pipe_gap_y + GAP_SIZE / 2));
+        }
+
+        // Circular yellow bird
+        bird_obj = lv_obj_create(game_area);
+        if (bird_obj) {
+            lv_obj_set_style_bg_color(bird_obj, lv_palette_main(LV_PALETTE_YELLOW), 0);
+            lv_obj_set_style_bg_opa(bird_obj, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(bird_obj, 0, 0);
+            lv_obj_set_style_radius(bird_obj, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_size(bird_obj, BIRD_SIZE, BIRD_SIZE);
+            lv_obj_set_pos(bird_obj, BIRD_X, (int)bird_y);
+        }
+
+        // Score display
+        lbl_score = lv_label_create(game_area);
+        if (lbl_score) {
+            lv_obj_align(lbl_score, LV_ALIGN_TOP_MID, 0, 10);
+            lv_obj_set_style_text_font(lbl_score, &lv_font_montserrat_14, 0);
+            lv_label_set_text(lbl_score, "Score: 0 | High: 0");
+        }
+
+        // Click / Startup overlay message
+        lbl_status = lv_label_create(game_area);
+        if (lbl_status) {
+            lv_obj_align(lbl_status, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_text_align(lbl_status, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_color(lbl_status, lv_palette_main(LV_PALETTE_AMBER), 0);
+            lv_label_set_text(lbl_status, "TAP TO START / FLAP\n(Long Press to Exit)");
+        }
+    }
 }
 
 static uint8_t core0_stack[16384] __attribute__((aligned(16)));
@@ -343,17 +477,23 @@ void real_main(void) {
             button_processed = false;
         }
 
+        uint16_t active_tab_idx = 0;
+        if (tabview) {
+            active_tab_idx = lv_tabview_get_tab_active(tabview);
+        }
+
         if (btn_pressed && !button_processed) {
             uint32_t current_time = time_us_32() / 1000;
             if (current_time - press_start_time >= 800) {
-                // Long press detected! Switch tabs
+                // Long press detected! Switch tabs (cycles through all 4 tabs)
                 static int active_tab = 0;
-                active_tab = (active_tab + 1) % 3;
+                active_tab = (active_tab + 1) % 4; // Dashboard -> Controls -> System -> Game
                 if (tabview) {
                     lv_tabview_set_active(tabview, active_tab, LV_ANIM_ON);
                 }
                 printf("[main] Long press detected! Switching to tab %d \r\n", active_tab);
                 button_processed = true;
+                waiting_for_double_click = false; // Cancel any pending clicks
             }
         }
 
@@ -362,20 +502,46 @@ void real_main(void) {
             if (!button_processed) {
                 uint32_t duration = release_time - press_start_time;
                 if (duration < 800) {
-                    if (release_time - last_click_time < 350) {
-                        // Double click detected! Move focus to next widget
-                        lv_group_focus_next(lv_group_get_default());
-                        printf("[main] Double click! Focus moved to next widget.\r\n");
-                        waiting_for_double_click = false;
+                    if (active_tab_idx == 3) {
+                        // Game Tab active -> Single click flaps instantly, no double-click delay needed!
+                        if (!game_active) {
+                            // Start/restart game
+                            bird_y = 120.0f;
+                            bird_velocity = 0.0f;
+                            pipe_x = 640.0f;
+                            pipe_gap_y = 100.0f + (rand() % 80); // random gap center
+                            score = 0;
+                            game_active = true;
+                            game_over = false;
+                            if (lbl_status) lv_obj_add_flag(lbl_status, LV_OBJ_FLAG_HIDDEN);
+                            
+                            printf("[game] Start/Restart! Game active = true, variables reset.\r\n");
+
+                            char str_score[64];
+                            snprintf(str_score, sizeof(str_score), "Score: %d | High: %d", score, high_score);
+                            if (lbl_score) lv_label_set_text(lbl_score, str_score);
+                        }
+                        bird_velocity = FLAP_IMPULSE;
+                        current_sfx = SFX_FLAP;
+                        sfx_frame = 0;
+                        printf("[game] Flapped! Velocity = %.1f\r\n", bird_velocity);
                     } else {
-                        waiting_for_double_click = true;
+                        // Other tabs -> Standard double click / single click detection
+                        if (release_time - last_click_time < 350) {
+                            // Double click detected! Move focus to next widget
+                            lv_group_focus_next(lv_group_get_default());
+                            printf("[main] Double click! Focus moved to next widget.\r\n");
+                            waiting_for_double_click = false;
+                        } else {
+                            waiting_for_double_click = true;
+                        }
                     }
                     last_click_time = release_time;
                 }
             }
         }
 
-        if (waiting_for_double_click) {
+        if (waiting_for_double_click && active_tab_idx != 3) {
             uint32_t current_time = time_us_32() / 1000;
             if (current_time - last_click_time >= 350) {
                 // Single click detected! Send LV_EVENT_CLICKED directly to focused widget
@@ -389,6 +555,98 @@ void real_main(void) {
         }
 
         last_btn_state = btn_pressed;
+
+        // 50 Hz Flappy Bird Game Physics Tick
+        static uint32_t last_game_update = 0;
+        uint32_t now_ms = time_us_32() / 1000;
+        if (now_ms - last_game_update >= 20) {
+            last_game_update = now_ms;
+
+            if (game_active) {
+                // Apply gravity & velocity
+                bird_velocity += GRAVITY;
+                if (bird_velocity > 8.0f) bird_velocity = 8.0f; // Terminal velocity
+                bird_y += bird_velocity;
+
+                // Scroll pipe
+                pipe_x -= PIPE_SPEED;
+                if (pipe_x < -PIPE_WIDTH) {
+                    pipe_x = GAME_WIDTH;
+                    pipe_gap_y = 60.0f + (rand() % 100); // Random gap center (60 to 160)
+                    score++;
+                    current_sfx = SFX_POINT;
+                    sfx_frame = 0;
+                    
+                    printf("[game] Score! Current score = %d\r\n", score);
+                    
+                    char str_score[64];
+                    if (score > high_score) {
+                        high_score = score;
+                    }
+                    snprintf(str_score, sizeof(str_score), "Score: %d | High: %d", score, high_score);
+                    if (lbl_score) lv_label_set_text(lbl_score, str_score);
+                }
+
+                // Collision Checks
+                bool collided = false;
+                
+                // Ground/Ceiling check
+                if (bird_y <= 0 || bird_y + BIRD_SIZE >= GAME_HEIGHT) {
+                    collided = true;
+                }
+                
+                // Pipe check
+                if (BIRD_X + BIRD_SIZE >= pipe_x && BIRD_X <= pipe_x + PIPE_WIDTH) {
+                    // Check if outside the gap
+                    float gap_top = pipe_gap_y - GAP_SIZE / 2;
+                    float gap_bottom = pipe_gap_y + GAP_SIZE / 2;
+                    if (bird_y < gap_top || bird_y + BIRD_SIZE > gap_bottom) {
+                        collided = true;
+                    }
+                }
+
+                if (collided) {
+                    // Game Over!
+                    game_active = false;
+                    game_over = true;
+                    current_sfx = SFX_CRASH;
+                    sfx_frame = 0;
+                    
+                    printf("[game] Collided! Game Over. Final Score = %d, High Score = %d\r\n", score, high_score);
+                    
+                    if (lbl_status) {
+                        lv_label_set_text(lbl_status, "GAME OVER\nTAP TO RESTART\n(Long Press to Exit)");
+                        lv_obj_remove_flag(lbl_status, LV_OBJ_FLAG_HIDDEN);
+                    }
+                }
+
+                // Update widget layout
+                if (bird_obj) lv_obj_set_pos(bird_obj, BIRD_X, (int)bird_y);
+                
+                if (pipe_top) {
+                    int top_h = (int)(pipe_gap_y - GAP_SIZE / 2);
+                    if (top_h < 0) top_h = 0;
+                    lv_obj_set_size(pipe_top, PIPE_WIDTH, top_h);
+                    lv_obj_set_pos(pipe_top, (int)pipe_x, 0);
+                }
+                
+                if (pipe_bottom) {
+                    int bot_y = (int)(pipe_gap_y + GAP_SIZE / 2);
+                    int bot_h = GAME_HEIGHT - bot_y;
+                    if (bot_h < 0) bot_h = 0;
+                    lv_obj_set_size(pipe_bottom, PIPE_WIDTH, bot_h);
+                    lv_obj_set_pos(pipe_bottom, (int)pipe_x, bot_y);
+                }
+            } else {
+                // If not playing, let the bird hover gently in place
+                static float hover_angle = 0.0f;
+                hover_angle += 0.1f;
+                if (!game_over) {
+                    bird_y = 120.0f + sinf(hover_angle) * 5.0f;
+                    if (bird_obj) lv_obj_set_pos(bird_obj, BIRD_X, (int)bird_y);
+                }
+            }
+        }
 
         // Perform frame-level melody updates
         if (video_frame_count != last_frame) {
