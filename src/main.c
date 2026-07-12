@@ -1,18 +1,6 @@
-/**
- * pico_hdmi Bouncing Box (rt) Example
- *
- * Same visuals as bouncing_box, but goes through the runtime-mode-switching
- * variant of the library (video_output_rt.c) at 1280x720 @ 60Hz (CEA VIC 4).
- *
- * The CMakeLists enables PICO_HDMI_RUNTIME_MODES and defines VIDEO_MODE_1280x720
- * on both the library and this executable.
- *
- * Target: RP2350 (Raspberry Pi Pico 2), overclocked to 372 MHz at 1.3V core.
- */
-
 #include "pico_hdmi/hstx_data_island_queue.h"
 #include "pico_hdmi/hstx_packet.h"
-#include "pico_hdmi/video_output.h" // for DI_HSYNC_ACTIVE
+#include "pico_hdmi/video_output.h"
 #include "pico_hdmi/video_output_rt.h"
 
 #include "pico/multicore.h"
@@ -25,37 +13,19 @@
 
 #include <math.h>
 #include <string.h>
-
-#include "audio.h"
-
 #include <malloc.h>
-#include <pico/stdlib.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <wchar.h>
 
-#include <sys/time.h>
+#include "audio.h"
+#include "lvgl.h"
+#include "lv_port_disp.h"
+#include "lv_port_indev.h"
 
-#include <aps.h>
-#include <font6x9.h>
-#include <fps.h>
-#include <hagl.h>
-#include <hagl_hal.h>
-
-#include "deform.h"
-#include "metaballs.h"
-#include "plasma.h"
-#include "rotozoom.h"
-#include "life.h"
-
-// Audio configuration
+// Audio Configuration
 #define AUDIO_SAMPLE_RATE 48000
 #define TONE_AMPLITUDE 6000
-
-// ============================================================================
-// Audio State - Für Elise
-// ============================================================================
 
 #define SINE_TABLE_SIZE 256
 static int16_t sine_table[SINE_TABLE_SIZE];
@@ -63,51 +33,20 @@ static uint32_t audio_phase = 0;
 static uint32_t phase_increment = 0;
 static int audio_frame_counter = 0;
 
-// Use Korobeiniki for the demo (Für Elise kept for reference)
-
 static int current_melody_length = KOROBEINIKI_LENGTH;
-
 static int melody_index = 0;
 static int note_frames_remaining = 0;
 
-// From pico_effects
-static uint8_t effect = 3;
-volatile bool fps_flag = false;
-volatile bool switch_flag = true;
-static fps_instance_t fps;
-static aps_instance_t bps;
-
-// static uint8_t *buffer;
-// static hagl_backend_t backend;
-static hagl_backend_t *display;
-
-wchar_t message[32];
-
-static const uint64_t US_PER_FRAME_60_FPS = 1000000 / 60;
-static const uint64_t US_PER_FRAME_30_FPS = 1000000 / 30;
-static const uint64_t US_PER_FRAME_25_FPS = 1000000 / 25;
-
-static char demo[5][32] = {
-    "METABALLS",
-    "PLASMA",
-    "ROTOZOOM",
-    "DEFORM",
-    "LIFE",
-};
-
-static void init_sine_table(void)
-{
+static void init_sine_table(void) {
     for (int i = 0; i < SINE_TABLE_SIZE; i++) {
-        float angle = (float)i * 2.0F * 3.14159265F / SINE_TABLE_SIZE;
+        float angle = (float)i * 2.0f * 3.14159265f / SINE_TABLE_SIZE;
         sine_table[i] = (int16_t)(sinf(angle) * TONE_AMPLITUDE);
     }
 }
 
-static void advance_melody(void)
-{
+static void advance_melody(void) {
     if (--note_frames_remaining <= 0) {
         melody_index = (melody_index + 1) % current_melody_length;
-
         note_frames_remaining = current_melody[melody_index].duration;
         uint16_t freq = current_melody[melody_index].freq;
         if (freq > 0) {
@@ -118,21 +57,17 @@ static void advance_melody(void)
     }
 }
 
-static inline int16_t get_sine_sample(void)
-{
-    if (phase_increment == 0)
-        return 0; // Rest
+static inline int16_t get_sine_sample(void) {
+    if (phase_increment == 0) return 0;
     int16_t s = sine_table[(audio_phase >> 24) & 0xFF];
     audio_phase += phase_increment;
     return s;
 }
 
-static void generate_audio(void)
-{
-    // Keep the audio queue fed
-    // Change this to like 500 and DI_RING_BUFFER_SIZE to 512 so the audio just slows down and not lag horribly
-    // Or just disable audio tbh
-    while (hstx_di_queue_get_level() < 200) {
+static void generate_audio(void) {
+    int iterations = 0;
+    while (hstx_di_queue_get_level() < 200 && iterations < 50) {
+        iterations++;
         audio_sample_t samples[4];
         for (int i = 0; i < 4; i++) {
             int16_t s = get_sine_sample();
@@ -151,286 +86,307 @@ static void generate_audio(void)
     }
 }
 
-
-// From pico_effects
-
-size_t total_heap() {
-    extern char __StackLimit, __bss_end__;
-
-    return &__StackLimit - &__bss_end__;
+// Tick callback helper
+static uint32_t my_tick_get_cb(void) {
+    return time_us_32() / 1000;
 }
 
-size_t free_heap(void) {
-    struct mallinfo m = mallinfo();
+// UI Objects
+static lv_obj_t *tabview;
+static lv_obj_t *progress_bar;
+static lv_obj_t *cpu_arc;
+static lv_obj_t *lbl_stats_heap;
+static lv_obj_t *lbl_stats_resync;
+static lv_obj_t *lbl_stats_frame;
 
-    return total_heap() - m.uordblks;
+// Dark/Light Mode toggle event callback
+static void theme_btn_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        static bool dark_mode = true;
+        dark_mode = !dark_mode;
+
+        // Re-initialize default theme with toggled mode using valid display pointer
+        lv_display_t *disp = lv_display_get_default();
+        if (disp) {
+            lv_theme_t *th = lv_theme_default_init(
+                disp,
+                lv_palette_main(LV_PALETTE_DEEP_PURPLE),
+                lv_palette_main(LV_PALETTE_AMBER),
+                dark_mode,
+                LV_FONT_DEFAULT
+            );
+            lv_display_set_theme(disp, th);
+        }
+    }
 }
 
-bool switch_timer_callback(struct repeating_timer *t) {
-    switch_flag = true;
-    return true;
-}
+void build_ui(void) {
+    // Create tabview
+    tabview = lv_tabview_create(lv_screen_active());
+    if (tabview == NULL) {
+        printf("[main] ERROR: Failed to create tabview!\r\n");
+        return;
+    }
+    lv_tabview_set_tab_bar_position(tabview, LV_DIR_TOP);
+    lv_tabview_set_tab_bar_size(tabview, 40);
 
-bool show_timer_callback(struct repeating_timer *t) {
-    fps_flag = true;
-    return true;
-}
+    lv_obj_t *tab1 = lv_tabview_add_tab(tabview, "Dashboard");
+    lv_obj_t *tab2 = lv_tabview_add_tab(tabview, "Controls");
+    lv_obj_t *tab3 = lv_tabview_add_tab(tabview, "System");
 
-void static inline switch_demo() {
-    switch_flag = false;
-    printf("[switch] closing effect %d\r\n", effect);
-
-    switch (effect) {
-        case 0:
-            //metaballs_close();
-            break;
-        case 1:
-            plasma_close();
-            break;
-        case 2:
-            //rotozoom_close();
-            break;
-        case 3:
-            deform_close();
-            break;
-        case 4:
-            life_close();
-            break;
+    if (tab1 == NULL || tab2 == NULL || tab3 == NULL) {
+        printf("[main] ERROR: Failed to create one of the tabs!\r\n");
+        return;
     }
 
-    effect = (effect + 1) % 5;
-    printf("[switch] opening effect %d, free heap: %d\r\n", effect, free_heap());
+    // ==========================================
+    // Tab 1: Dashboard
+    // ==========================================
+    lv_obj_set_flex_flow(tab1, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(tab1, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(tab1, 10, 0);
 
-    switch (effect) {
-        case 0:
-            printf("[switch] metaballs_init start\r\n");
-            metaballs_init(display);
-            printf("[switch] metaballs_init done\r\n");
-            break;
-        case 1:
-            printf("[switch] plasma_init start\r\n");
-            plasma_init(display);
-            printf("[switch] plasma_init done\r\n");
-            break;
-        case 2:
-            printf("[switch] rotozoom_init start\r\n");
-            rotozoom_init(display);
-            printf("[switch] rotozoom_init done\r\n");
-            break;
-        case 3:
-            printf("[switch] deform_init start\r\n");
-            deform_init(display);
-            printf("[switch] deform_init done\r\n");
-            break;
-        case 4:
-            printf("[switch] life_init start\r\n");
-            life_init(display);
-            printf("[switch] life_init done\r\n");
-            break;
+    lv_obj_t *title = lv_label_create(tab1);
+    if (title) {
+        lv_label_set_text(title, "PicoHDMI + LVGL 9.5");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     }
 
-    fps_init(&fps);
-    aps_init(&bps);
+    lv_obj_t *desc = lv_label_create(tab1);
+    if (desc) {
+        lv_label_set_text(desc, "Press GPIO 23 button to switch tabs!");
+        lv_obj_set_style_text_color(desc, lv_palette_main(LV_PALETTE_GREY), 0);
+    }
+
+    // Progress Bar showing animated progress
+    progress_bar = lv_bar_create(tab1);
+    if (progress_bar) {
+        lv_obj_set_size(progress_bar, 280, 15);
+        lv_bar_set_value(progress_bar, 0, LV_ANIM_OFF);
+    }
+
+    // Animated Arc
+    cpu_arc = lv_arc_create(tab1);
+    if (cpu_arc) {
+        lv_obj_set_size(cpu_arc, 80, 80);
+        lv_arc_set_rotation(cpu_arc, 135);
+        lv_arc_set_bg_angles(cpu_arc, 0, 270);
+        lv_arc_set_value(cpu_arc, 10);
+    }
+
+    // ==========================================
+    // Tab 2: Controls
+    // ==========================================
+    lv_obj_set_flex_flow(tab2, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(tab2, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(tab2, 10, 0);
+
+    lv_obj_t *ctrl_title = lv_label_create(tab2);
+    if (ctrl_title) {
+        lv_label_set_text(ctrl_title, "Interactive Control");
+        lv_obj_set_style_text_font(ctrl_title, &lv_font_montserrat_18, 0);
+    }
+
+    // Button to toggle theme
+    lv_obj_t *btn_theme = lv_button_create(tab2);
+    if (btn_theme) {
+        lv_obj_set_size(btn_theme, 180, 40);
+        lv_obj_add_event_cb(btn_theme, theme_btn_event_cb, LV_EVENT_ALL, NULL);
+
+        lv_obj_t *btn_theme_label = lv_label_create(btn_theme);
+        if (btn_theme_label) {
+            lv_label_set_text(btn_theme_label, "Toggle Theme");
+            lv_obj_center(btn_theme_label);
+        }
+    }
+
+    // Dynamic Slider
+    lv_obj_t *slider = lv_slider_create(tab2);
+    if (slider) {
+        lv_obj_set_size(slider, 200, 10);
+        lv_slider_set_value(slider, 50, LV_ANIM_OFF);
+    }
+
+    // ==========================================
+    // Tab 3: System Specs
+    // ==========================================
+    lv_obj_set_flex_flow(tab3, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(tab3, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(tab3, 20, 0);
+
+    lv_obj_t *sys_title = lv_label_create(tab3);
+    if (sys_title) {
+        lv_label_set_text(sys_title, "System Statistics");
+        lv_obj_set_style_text_font(sys_title, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_margin_bottom(sys_title, 10, 0);
+    }
+
+    // Info Labels
+    lv_obj_t *lbl_mcu = lv_label_create(tab3);
+    if (lbl_mcu) {
+        lv_label_set_text(lbl_mcu, "MCU: Raspberry Pi RP2350 @ 372 MHz");
+    }
+
+    lv_obj_t *lbl_signal = lv_label_create(tab3);
+    if (lbl_signal) {
+        lv_label_set_text(lbl_signal, "Output: 1280x720 HDMI (640x360 Scaled 2x)");
+    }
+
+    lbl_stats_heap = lv_label_create(tab3);
+    lbl_stats_resync = lv_label_create(tab3);
+    lbl_stats_frame = lv_label_create(tab3);
 }
 
-void static inline show_fps() {
-    hagl_color_t green = hagl_color(display, 0, 255, 0);
+static uint8_t core0_stack[16384] __attribute__((aligned(16)));
 
-    fps_flag = 0;
+void real_main(void);
 
-    /* Set clip window to full screen so we can display the messages. */
-    hagl_set_clip(display, 0, 0, display->width - 1, display->height - 1);
-
-    /* Print the message on top left corner. */
-    swprintf(message, sizeof(message), L"%s    ", demo[effect]);
-    hagl_put_text(display, message, 4, 4, green, font6x9);
-
-    /* Print the message on lower left corner. */
-    swprintf(message, sizeof(message), L"%.*f FPS  ", 0, fps.current);
-    hagl_put_text(display, message, 4, display->height - 14, green, font6x9);
-
-    /* Print the message on lower right corner. */
-    swprintf(message, sizeof(message), L"@adminispwd, misa.pw", 0);
-    hagl_put_text(
-        display, message, display->width - 130, display->height - 14, green, font6x9
+int main(void) {
+    // Switch Core 0 stack pointer to main SRAM buffer to prevent Scratch Y overflow
+    __asm volatile (
+        "msr msp, %0 \n"
+        "isb \n"
+        : : "r" (&core0_stack[16384]) : "memory"
     );
-
-    /* Set clip window back to smaller so effects do not mess the messages. */
-    hagl_set_clip(display, 0, 20, display->width - 1, display->height - 21);
+    real_main();
+    while (1);
 }
 
-// ============================================================================
-// Main (Core 0)
-// ============================================================================
-int main(void)
-{
-    // Immediate LED initialization to debug boot success
+void real_main(void) {
+    // LED Init for boot diagnostics
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     gpio_put(PICO_DEFAULT_LED_PIN, true);
 
-    // 720p60: 372 MHz at 1.3V. Closest achievable to 371.25 MHz with 12 MHz XOSC
-    // (0.2% high -> 74.4 MHz pixel clock, within HDMI tolerance for 720p60).
-    // vreg_set_voltage(VREG_VOLTAGE_1_30);
-    // sleep_ms(10);
-    // set_sys_clock_khz(372000, true);
-
-    vreg_set_voltage(VREG_VOLTAGE_1_30);
-    sleep_ms(20);
-
-    qmi_hw->m[0].timing = (qmi_hw->m[0].timing & ~0xFF) | 4;
-
-    volatile uint32_t *flash_ptr = (volatile uint32_t *)0x10000000;
-    (void)*flash_ptr;
-
-    set_sys_clock_khz(384000, true);
-
-    clock_configure(
-        clk_usb,
-        0, // clk_usb does not have a primary glitchless multiplexer
-        CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
-        384 * MHZ,
-        48 * MHZ);
-
-    clock_configure(
-        clk_adc,
-        0,
-        CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
-        384 * MHZ,
-        48 * MHZ);
-
-    pll_init(pll_usb, 1, 1008 * MHZ, 4, 2);
- 
-    clock_configure(
-        clk_hstx,
-        0,
-        CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
-        126 * MHZ,
-        126 * MHZ);
+    // Set system clock to 252 MHz (safe, nominal timing for 640x480p60 HDMI)
+    // No vreg voltage elevation or QMI flash overrides required.
+    set_sys_clock_khz(252000, true);
 
     sleep_ms(2500);
-
     stdio_init_all();
-
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-
-    sleep_ms(2500);
-
-    
-
     printf("[main] stdio inited \r\n");
 
-    // From pico_effects
-    size_t bytes = 0;
-    struct repeating_timer switch_timer;
-    struct repeating_timer show_timer;
+    // Initialize LVGL
+    lv_init();
 
-    printf("[main] %d total heap \r\n", total_heap());
-    printf("[main] %d free heap \r\n", free_heap());
+    // Register custom tick source
+    lv_tick_set_cb(my_tick_get_cb);
 
-    fps_init(&fps);
-
-    display = hagl_init();
-    printf("[main] display inited \r\n");
+    // Initialize Ports (HDMI Core 1 + Display buffer + Input Button)
+    lv_port_disp_init();
+    lv_port_indev_init();
+    printf("[main] LVGL display and input drivers registered \r\n");
+    sleep_ms(2500);
     
+    // Build the user interface
+    build_ui();
+    printf("[main] UI widgets constructed \r\n");
 
-    hagl_clear(display);
-    hagl_set_clip(display, 0, 20, display->width - 1, display->height - 21);
-    
+    // Set initial default theme using default display pointer
+    lv_display_t *disp = lv_display_get_default();
+    if (disp) {
+        lv_theme_t *th = lv_theme_default_init(
+            disp,
+            lv_palette_main(LV_PALETTE_DEEP_PURPLE),
+            lv_palette_main(LV_PALETTE_AMBER),
+            true, // default dark mode
+            LV_FONT_DEFAULT
+        );
+        lv_display_set_theme(disp, th);
+    }
 
-    /* Change demo every 10 seconds. */
-    add_repeating_timer_ms(5000, switch_timer_callback, NULL, &switch_timer);
-
-    /* Update displayed FPS counter every 250 ms. */
-    add_repeating_timer_ms(250, show_timer_callback, NULL, &show_timer);
-
-    printf("[main] timer inited \r\n");
-
+    // Audio State Init
     init_sine_table();
     note_frames_remaining = current_melody[0].duration;
     phase_increment = (uint32_t)(((uint64_t)current_melody[0].freq << 32) / AUDIO_SAMPLE_RATE);
-
-    // Pre-fill audio buffer
     generate_audio();
 
     // Main loop - animation + audio
     uint32_t last_frame = 0;
     bool led_state = false;
+    uint32_t tick_counter = 0;
+    bool last_btn_state = false;
 
-    printf("[main] loop starting \r\n");
+    printf("[main] entering main execution loop \r\n");
     while (1) {
-        // Keep audio buffer fed
+        // Keep HDMI Audio Buffer filled
         generate_audio();
 
-        while (video_frame_count == last_frame) {
-            generate_audio();
-            tight_loop_contents();
+        // Increment LVGL ticks (handled by custom callback)
+        lv_timer_handler();
+
+        // Check for button press on GPIO 23 to switch tabs
+        bool btn_pressed = lv_port_indev_is_button_pressed();
+        if (btn_pressed && !last_btn_state) {
+            static int active_tab = 0;
+            active_tab = (active_tab + 1) % 3;
+            if (tabview) {
+                lv_tabview_set_active(tabview, active_tab, LV_ANIM_ON);
+            }
+            printf("[main] GPIO 23 button press detected! Switching to tab %d \r\n", active_tab);
         }
-        last_frame = video_frame_count;
+        last_btn_state = btn_pressed;
 
-        // from pico_effects
-        {
-            // uint64_t start = time_us_64();
+        // Perform frame-level melody updates
+        if (video_frame_count != last_frame) {
+            last_frame = video_frame_count;
+            advance_melody();
 
-            switch (effect) {
-                case 0:
-                    metaballs_animate(display);
-                    metaballs_render(display);
-                    break;
-                case 1:
-                    plasma_animate(display);
-                    plasma_render(display);
-                    break;
-                case 2:
-                    rotozoom_animate();
-                    rotozoom_render(display);
-                    break;
-                case 3:
-                    deform_animate();
-                    deform_render(display);
-                    break;
-                case 4:
-                    life_animate(display);
-                    life_render(display);
-                    break;
+            // Toggle LED every 30 video frames
+            if ((video_frame_count % 30) == 0) {
+                led_state = !led_state;
+                gpio_put(PICO_DEFAULT_LED_PIN, led_state);
+            }
+        }
+
+        // Slowly animate UI widgets
+        tick_counter++;
+        if ((tick_counter % 5000) == 0) {
+            printf("[main] loop heartbeat: ticks=%u frames=%u\r\n", (unsigned int)tick_counter, (unsigned int)video_frame_count);
+        }
+        if ((tick_counter % 20) == 0) {
+            // Animate Progress Bar
+            if (progress_bar) {
+                static int progress_val = 0;
+                progress_val = (progress_val + 1) % 101;
+                lv_bar_set_value(progress_bar, progress_val, LV_ANIM_ON);
             }
 
-            /* Update the displayed fps if requested. */
-            show_fps();
-
-            /* Flush back buffer contents to display. NOP if single buffering. */
-            bytes = hagl_flush(display);
-
-            aps_update(&bps, bytes);
-            fps_update(&fps);
-
-            /* Print the message in console and switch to next demo. */
-            if (switch_flag) {
-                printf(
-                    "[main] %s at %d fps / %d kBps\r\n",
-                    demo[effect],
-                    (uint32_t)fps.current,
-                    (uint32_t)(bps.current / 1024)
-                );
-                switch_demo();
+            // Animate Arc
+            if (cpu_arc) {
+                static int arc_val = 10;
+                static int arc_dir = 1;
+                arc_val += arc_dir * 2;
+                if (arc_val >= 90) { arc_val = 90; arc_dir = -1; }
+                if (arc_val <= 10) { arc_val = 10; arc_dir = 1; }
+                lv_arc_set_value(cpu_arc, arc_val);
             }
 
-            // /* Cap the demos to 60 fps. This is mostly to accommodate to smaller */
-            // /* screens where plasma will run too fast. */
-            // busy_wait_until(start + US_PER_FRAME_60_FPS);
+            // Update stats
+            if (lbl_stats_heap) {
+                lv_mem_monitor_t mon;
+                lv_mem_monitor(&mon);
+                char str_heap[64];
+                snprintf(str_heap, sizeof(str_heap), "LVGL Heap Free: %u KB", (unsigned int)(mon.free_size / 1024));
+                lv_label_set_text(lbl_stats_heap, str_heap);
+            }
+
+            if (lbl_stats_resync) {
+                char str_resync[64];
+                extern volatile uint32_t video_output_resync_count;
+                snprintf(str_resync, sizeof(str_resync), "HDMI Resync Count: %u", (unsigned int)video_output_resync_count);
+                lv_label_set_text(lbl_stats_resync, str_resync);
+            }
+
+            if (lbl_stats_frame) {
+                char str_frame[64];
+                snprintf(str_frame, sizeof(str_frame), "Video Frames Rendered: %u", (unsigned int)video_frame_count);
+                lv_label_set_text(lbl_stats_frame, str_frame);
+            }
         }
 
-        // Advance melody (one note step per frame)
-        advance_melody();
-
-        // LED heartbeat
-        if ((video_frame_count % 30) == 0) {
-            led_state = !led_state;
-            gpio_put(PICO_DEFAULT_LED_PIN, led_state);
-        }
-
-
+        sleep_ms(1);
     }
 
     return 0;
