@@ -137,6 +137,93 @@ static lv_obj_t *btn_theme = NULL;
 static lv_obj_t *btn_audio_cycle = NULL;
 static lv_obj_t *slider = NULL;
 
+// Toast notification variables
+static lv_obj_t *toast_label = NULL;
+static uint32_t toast_hide_time = 0;
+
+// Dynamic Weekday calculator (Sakamoto's algorithm)
+const char* get_day_of_week(int day, int month, int year) {
+    static const char *days[] = {
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
+    };
+    static int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (month < 3) {
+        year -= 1;
+    }
+    int dow = (year + year/4 - year/100 + year/400 + t[month-1] + day) % 7;
+    return days[dow];
+}
+
+// Custom Space-Tolerant JSON Time & Date Parser
+bool parse_time_json(const char *json_raw, int *h, int *m, int *s, int *d, int *mo, int *y) {
+    // 1. Strip all whitespaces (spaces, tabs, newlines, carriage returns)
+    char json[256];
+    int dest_idx = 0;
+    for (int i = 0; json_raw[i] != '\0' && dest_idx < 255; i++) {
+        char c = json_raw[i];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+            json[dest_idx++] = c;
+        }
+    }
+    json[dest_idx] = '\0';
+
+    // 2. Search for "time":" or 'time':'
+    const char *time_ptr = strstr(json, "\"time\":\"");
+    if (!time_ptr) {
+        time_ptr = strstr(json, "'time':'");
+    }
+    if (!time_ptr) return false;
+    time_ptr += 8; // skip prefix
+
+    int th = 0, tm = 0, ts = 0;
+    if (sscanf(time_ptr, "%d:%d:%d", &th, &tm, &ts) != 3) return false;
+    if (th < 0 || th > 23 || tm < 0 || tm > 59 || ts < 0 || ts > 59) return false;
+
+    // 3. Search for "date":" or 'date':'
+    const char *date_ptr = strstr(json, "\"date\":\"");
+    if (!date_ptr) {
+        date_ptr = strstr(json, "'date':'");
+    }
+    if (!date_ptr) return false;
+    date_ptr += 8; // skip prefix
+
+    int ty = 0, tmo = 0, td = 0;
+    if (sscanf(date_ptr, "%d-%d-%d", &ty, &tmo, &td) != 3) return false;
+    if (ty < 2000 || ty > 2100 || tmo < 1 || tmo > 12 || td < 1 || td > 31) return false;
+
+    *h = th;
+    *m = tm;
+    *s = ts;
+    *y = ty;
+    *mo = tmo;
+    *d = td;
+    
+    return true;
+}
+
+// Show Toast notification using LVGL
+void show_toast(const char *message) {
+    if (toast_label == NULL) {
+        toast_label = lv_label_create(lv_screen_active());
+        if (toast_label) {
+            lv_obj_set_style_bg_color(toast_label, lv_color_hex(0x202020), 0);
+            lv_obj_set_style_bg_opa(toast_label, LV_OPA_90, 0);
+            lv_obj_set_style_text_color(toast_label, lv_color_white(), 0);
+            lv_obj_set_style_border_color(toast_label, lv_palette_main(LV_PALETTE_AMBER), 0);
+            lv_obj_set_style_border_width(toast_label, 1, 0);
+            lv_obj_set_style_pad_all(toast_label, 8, 0);
+            lv_obj_set_style_radius(toast_label, 8, 0);
+            lv_obj_align(toast_label, LV_ALIGN_BOTTOM_MID, 0, -20);
+        }
+    }
+    
+    if (toast_label) {
+        lv_label_set_text(toast_label, message);
+        lv_obj_remove_flag(toast_label, LV_OBJ_FLAG_HIDDEN);
+        toast_hide_time = (time_us_32() / 1000) + 2500; // Visible for 2.5s
+    }
+}
+
 static inline int16_t get_sine_sample(void) {
     uint32_t sfx_phase_inc = 0;
     
@@ -654,6 +741,51 @@ void real_main(void) {
 
     printf("[main] entering main execution loop \r\n");
     while (1) {
+        // 1. Non-blocking USB Serial Input Polling
+        static char rx_buf[256];
+        static int rx_idx = 0;
+        int c = getchar_timeout_us(0);
+        while (c != PICO_ERROR_TIMEOUT) {
+            if (c == '\n' || c == '\r') {
+                if (rx_idx > 0) {
+                    rx_buf[rx_idx] = '\0';
+                    printf("[serial] Received: %s\r\n", rx_buf);
+                    
+                    int h = 0, m = 0, s = 0, d = 0, mo = 0, y = 0;
+                    if (parse_time_json(rx_buf, &h, &m, &s, &d, &mo, &y)) {
+                        clock_hours = h;
+                        clock_minutes = m;
+                        clock_seconds = s;
+                        clock_day = d;
+                        clock_month = mo;
+                        clock_year = y;
+                        printf("[serial] Time synced successfully to %02d:%02d:%02d!\r\n", h, m, s);
+                        show_toast("Time Synced Successfully!");
+                    } else {
+                        // Only trigger warning toast if it looks like a JSON block
+                        if (rx_buf[0] == '{') {
+                            printf("[serial] Invalid JSON format or bounds error.\r\n");
+                            show_toast("Sync Failed: Invalid JSON!");
+                        }
+                    }
+                    rx_idx = 0;
+                }
+            } else if (c >= 32 && c < 127) {
+                if (rx_idx < sizeof(rx_buf) - 1) {
+                    rx_buf[rx_idx++] = (char)c;
+                }
+            }
+            c = getchar_timeout_us(0);
+        }
+
+        // 2. Auto-hide Active Toast notifications
+        if (toast_label && !(lv_obj_has_flag(toast_label, LV_OBJ_FLAG_HIDDEN))) {
+            uint32_t now = time_us_32() / 1000;
+            if (now >= toast_hide_time) {
+                lv_obj_add_flag(toast_label, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+
         // Keep HDMI Audio Buffer filled
         generate_audio();
 
@@ -901,7 +1033,8 @@ void real_main(void) {
 
             if (lbl_clock_date) {
                 char str_date[64];
-                snprintf(str_date, sizeof(str_date), "Sunday, %02d/%02d/%04d", clock_day, clock_month, clock_year);
+                const char *dow = get_day_of_week(clock_day, clock_month, clock_year);
+                snprintf(str_date, sizeof(str_date), "%s, %02d/%02d/%04d", dow, clock_day, clock_month, clock_year);
                 lv_label_set_text(lbl_clock_date, str_date);
             }
 
