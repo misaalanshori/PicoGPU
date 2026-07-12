@@ -259,6 +259,10 @@ void real_main(void) {
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     gpio_put(PICO_DEFAULT_LED_PIN, true);
 
+    gpio_init(24);
+    gpio_set_dir(24, GPIO_OUT);
+    gpio_put(24, true);
+
     // Set system clock to 252 MHz (safe, nominal timing for 640x480p60 HDMI)
     // No vreg voltage elevation or QMI flash overrides required.
     set_sys_clock_khz(252000, true);
@@ -337,6 +341,7 @@ void real_main(void) {
             if ((video_frame_count % 30) == 0) {
                 led_state = !led_state;
                 gpio_put(PICO_DEFAULT_LED_PIN, led_state);
+                gpio_put(24, led_state);
             }
         }
 
@@ -345,7 +350,7 @@ void real_main(void) {
         if ((tick_counter % 5000) == 0) {
             printf("[main] loop heartbeat: ticks=%u frames=%u\r\n", (unsigned int)tick_counter, (unsigned int)video_frame_count);
         }
-        if ((tick_counter % 20) == 0) {
+        if ((tick_counter % 17) == 0) {
             // Animate Progress Bar
             if (progress_bar) {
                 static int progress_val = 0;
@@ -362,7 +367,9 @@ void real_main(void) {
                 if (arc_val <= 10) { arc_val = 10; arc_dir = 1; }
                 lv_arc_set_value(cpu_arc, arc_val);
             }
+        }
 
+        if ((tick_counter % 32) == 0) {
             // Update stats
             if (lbl_stats_heap) {
                 lv_mem_monitor_t mon;
