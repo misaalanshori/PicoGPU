@@ -176,6 +176,7 @@ bool show_timer_callback(struct repeating_timer *t) {
 
 void static inline switch_demo() {
     switch_flag = false;
+    printf("[switch] closing effect %d\r\n", effect);
 
     switch (effect) {
         case 0:
@@ -193,23 +194,28 @@ void static inline switch_demo() {
     }
 
     effect = (effect + 1) % 4;
+    printf("[switch] opening effect %d, free heap: %d\r\n", effect, free_heap());
 
     switch (effect) {
         case 0:
+            printf("[switch] metaballs_init start\r\n");
             metaballs_init(display);
-            //printf("[main] Initialized metaballs, %d free heap \r\n", free_heap());
+            printf("[switch] metaballs_init done\r\n");
             break;
         case 1:
+            printf("[switch] plasma_init start\r\n");
             plasma_init(display);
-            //printf("[main] Initialized plasma, %d free heap \r\n", free_heap());
+            printf("[switch] plasma_init done\r\n");
             break;
         case 2:
+            printf("[switch] rotozoom_init start\r\n");
             rotozoom_init(display);
-            //printf("[main] Initialized rotozoom, %d free heap \r\n", free_heap());
+            printf("[switch] rotozoom_init done\r\n");
             break;
         case 3:
+            printf("[switch] deform_init start\r\n");
             deform_init(display);
-            //printf("[main] Initialized deform, %d free heap \r\n", free_heap());
+            printf("[switch] deform_init done\r\n");
             break;
     }
 
@@ -259,8 +265,7 @@ int main(void)
     // sleep_ms(10);
     // set_sys_clock_khz(372000, true);
 
-    vreg_disable_voltage_limit();
-    vreg_set_voltage(VREG_VOLTAGE_1_40);
+    vreg_set_voltage(VREG_VOLTAGE_1_30);
     sleep_ms(20);
 
     qmi_hw->m[0].timing = (qmi_hw->m[0].timing & ~0xFF) | 4;
@@ -268,30 +273,7 @@ int main(void)
     volatile uint32_t *flash_ptr = (volatile uint32_t *)0x10000000;
     (void)*flash_ptr;
 
-    set_sys_clock_khz(432000, true);
-
-    clock_configure(
-        clk_usb,
-        0, // clk_usb does not have a primary glitchless multiplexer
-        CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
-        432 * MHZ,
-        48 * MHZ);
-
-    clock_configure(
-        clk_adc,
-        0,
-        CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
-        432 * MHZ,
-        48 * MHZ);
-
-    pll_init(pll_usb, 1, 1116 * MHZ, 3, 1);
- 
-    clock_configure(
-        clk_hstx,
-        0,
-        CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
-        372 * MHZ,
-        372 * MHZ);
+    set_sys_clock_khz(372000, true);
 
     sleep_ms(2500);
 
