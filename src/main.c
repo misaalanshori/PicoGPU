@@ -47,6 +47,7 @@
 #include "metaballs.h"
 #include "plasma.h"
 #include "rotozoom.h"
+#include "life.h"
 
 // Audio configuration
 #define AUDIO_SAMPLE_RATE 48000
@@ -86,11 +87,12 @@ static const uint64_t US_PER_FRAME_60_FPS = 1000000 / 60;
 static const uint64_t US_PER_FRAME_30_FPS = 1000000 / 30;
 static const uint64_t US_PER_FRAME_25_FPS = 1000000 / 25;
 
-static char demo[4][32] = {
+static char demo[5][32] = {
     "METABALLS",
     "PLASMA",
     "ROTOZOOM",
     "DEFORM",
+    "LIFE",
 };
 
 static void init_sine_table(void)
@@ -191,9 +193,12 @@ void static inline switch_demo() {
         case 3:
             deform_close();
             break;
+        case 4:
+            life_close();
+            break;
     }
 
-    effect = (effect + 1) % 4;
+    effect = (effect + 1) % 5;
     printf("[switch] opening effect %d, free heap: %d\r\n", effect, free_heap());
 
     switch (effect) {
@@ -216,6 +221,11 @@ void static inline switch_demo() {
             printf("[switch] deform_init start\r\n");
             deform_init(display);
             printf("[switch] deform_init done\r\n");
+            break;
+        case 4:
+            printf("[switch] life_init start\r\n");
+            life_init(display);
+            printf("[switch] life_init done\r\n");
             break;
     }
 
@@ -379,6 +389,10 @@ int main(void)
                 case 3:
                     deform_animate();
                     deform_render(display);
+                    break;
+                case 4:
+                    life_animate(display);
+                    life_render(display);
                     break;
             }
 
