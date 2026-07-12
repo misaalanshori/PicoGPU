@@ -136,6 +136,7 @@ static lv_obj_t *btn_timer_mode = NULL;
 static lv_obj_t *btn_theme = NULL;
 static lv_obj_t *btn_audio_cycle = NULL;
 static lv_obj_t *slider = NULL;
+static lv_obj_t *text_editor = NULL;
 
 // Toast notification variables
 static lv_obj_t *toast_label = NULL;
@@ -423,10 +424,11 @@ void build_ui(void) {
 
     lv_obj_t *tab1 = lv_tabview_add_tab(tabview, "Dashboard");
     lv_obj_t *tab2 = lv_tabview_add_tab(tabview, "Controls");
+    lv_obj_t *tab_editor = lv_tabview_add_tab(tabview, "Editor");
     lv_obj_t *tab3 = lv_tabview_add_tab(tabview, "System");
     tab4 = lv_tabview_add_tab(tabview, "Game");
 
-    if (tab1 == NULL || tab2 == NULL || tab3 == NULL || tab4 == NULL) {
+    if (tab1 == NULL || tab2 == NULL || tab_editor == NULL || tab3 == NULL || tab4 == NULL) {
         printf("[main] ERROR: Failed to create one of the tabs!\r\n");
         return;
     }
@@ -568,6 +570,21 @@ void build_ui(void) {
         lv_group_remove_all_objs(g);
         if (btn_timer_toggle) lv_group_add_obj(g, btn_timer_toggle);
         if (btn_timer_mode) lv_group_add_obj(g, btn_timer_mode);
+    }
+
+    // ==========================================
+    // Tab: Editor (Text Editor)
+    // ==========================================
+    lv_obj_remove_flag(tab_editor, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(tab_editor, 10, 0);
+
+    text_editor = lv_textarea_create(tab_editor);
+    if (text_editor) {
+        lv_obj_set_size(text_editor, 620, 260);
+        lv_obj_align(text_editor, LV_ALIGN_CENTER, 0, 0);
+        lv_textarea_set_placeholder_text(text_editor, "Type in serial console to edit text...\nUse arrow keys & backspace!");
+        lv_textarea_set_cursor_click_pos(text_editor, true);
+        lv_obj_set_style_text_font(text_editor, &lv_font_montserrat_14, 0);
     }
 
     // ==========================================
@@ -741,38 +758,97 @@ void real_main(void) {
 
     printf("[main] entering main execution loop \r\n");
     while (1) {
-        // 1. Non-blocking USB Serial Input Polling
+        // 1. Non-blocking USB Serial Input Polling & Routing
         static char rx_buf[256];
         static int rx_idx = 0;
+        static int esc_state = 0; // 0=normal, 1=ESC, 2='['
         int c = getchar_timeout_us(0);
         while (c != PICO_ERROR_TIMEOUT) {
-            if (c == '\n' || c == '\r') {
-                if (rx_idx > 0) {
-                    rx_buf[rx_idx] = '\0';
-                    printf("[serial] Received: %s\r\n", rx_buf);
-                    
-                    int h = 0, m = 0, s = 0, d = 0, mo = 0, y = 0;
-                    if (parse_time_json(rx_buf, &h, &m, &s, &d, &mo, &y)) {
-                        clock_hours = h;
-                        clock_minutes = m;
-                        clock_seconds = s;
-                        clock_day = d;
-                        clock_month = mo;
-                        clock_year = y;
-                        printf("[serial] Time synced successfully to %02d:%02d:%02d!\r\n", h, m, s);
-                        show_toast("Time Synced Successfully!");
-                    } else {
-                        // Only trigger warning toast if it looks like a JSON block
-                        if (rx_buf[0] == '{') {
-                            printf("[serial] Invalid JSON format or bounds error.\r\n");
-                            show_toast("Sync Failed: Invalid JSON!");
+            uint16_t active_tab_idx = 0;
+            if (tabview) {
+                active_tab_idx = lv_tabview_get_tab_active(tabview);
+            }
+
+            if (active_tab_idx == 0) {
+                // --- Dashboard Mode: JSON sync ---
+                if (c == '\n' || c == '\r') {
+                    if (rx_idx > 0) {
+                        rx_buf[rx_idx] = '\0';
+                        printf("[serial] Received: %s\r\n", rx_buf);
+                        
+                        int h = 0, m = 0, s = 0, d = 0, mo = 0, y = 0;
+                        if (parse_time_json(rx_buf, &h, &m, &s, &d, &mo, &y)) {
+                            clock_hours = h;
+                            clock_minutes = m;
+                            clock_seconds = s;
+                            clock_day = d;
+                            clock_month = mo;
+                            clock_year = y;
+                            printf("[serial] Time synced successfully to %02d:%02d:%02d!\r\n", h, m, s);
+                            show_toast("Time Synced Successfully!");
+                        } else {
+                            if (rx_buf[0] == '{') {
+                                printf("[serial] Invalid JSON format or bounds error.\r\n");
+                                show_toast("Sync Failed: Invalid JSON!");
+                            }
                         }
+                        rx_idx = 0;
                     }
-                    rx_idx = 0;
+                } else if (c >= 32 && c < 127) {
+                    if (rx_idx < sizeof(rx_buf) - 1) {
+                        rx_buf[rx_idx++] = (char)c;
+                    }
                 }
-            } else if (c >= 32 && c < 127) {
-                if (rx_idx < sizeof(rx_buf) - 1) {
-                    rx_buf[rx_idx++] = (char)c;
+            } else if (active_tab_idx == 2) {
+                // --- Text Editor Mode: ANSI & Character Echo ---
+                if (text_editor) {
+                    if (esc_state == 0) {
+                        if (c == 27) { // ESC
+                            esc_state = 1;
+                        } else if (c == 8) { // Backspace
+                            lv_textarea_delete_char(text_editor);
+                        } else if (c == 127) { // DEL (Forward Delete)
+                            lv_textarea_delete_char_forward(text_editor);
+                        } else if (c == '\r' || c == '\n') { // Enter
+                            static uint32_t last_enter_time = 0;
+                            uint32_t now = time_us_32() / 1000;
+                            if (now - last_enter_time > 100) { // debounce for \r\n
+                                lv_textarea_add_char(text_editor, '\n');
+                                last_enter_time = now;
+                            }
+                        } else if (c >= 32 && c < 127) {
+                            lv_textarea_add_char(text_editor, (char)c);
+                        }
+                    } else if (esc_state == 1) {
+                        if (c == '[') {
+                            esc_state = 2;
+                        } else {
+                            esc_state = 0;
+                        }
+                    } else if (esc_state == 2) {
+                        if (c == 'A') { // Up arrow
+                            lv_textarea_cursor_up(text_editor);
+                            esc_state = 0;
+                        } else if (c == 'B') { // Down arrow
+                            lv_textarea_cursor_down(text_editor);
+                            esc_state = 0;
+                        } else if (c == 'C') { // Right arrow
+                            lv_textarea_cursor_right(text_editor);
+                            esc_state = 0;
+                        } else if (c == 'D') { // Left arrow
+                            lv_textarea_cursor_left(text_editor);
+                            esc_state = 0;
+                        } else if (c == '3') { // Delete key prefix (3)
+                            esc_state = 3;
+                        } else {
+                            esc_state = 0;
+                        }
+                    } else if (esc_state == 3) {
+                        if (c == '~') { // Delete key suffix (~)
+                            lv_textarea_delete_char_forward(text_editor);
+                        }
+                        esc_state = 0;
+                    }
                 }
             }
             c = getchar_timeout_us(0);
@@ -816,9 +892,9 @@ void real_main(void) {
         if (btn_pressed && !button_processed) {
             uint32_t current_time = time_us_32() / 1000;
             if (current_time - press_start_time >= 800) {
-                // Long press detected! Switch tabs (cycles through all 4 tabs)
+                // Long press detected! Switch tabs (cycles through all 5 tabs)
                 static int active_tab = 0;
-                active_tab = (active_tab + 1) % 4; // Dashboard -> Controls -> System -> Game
+                active_tab = (active_tab + 1) % 5; // Dashboard -> Controls -> Editor -> System -> Game
                 if (tabview) {
                     lv_tabview_set_active(tabview, active_tab, LV_ANIM_ON);
                 }
@@ -839,6 +915,9 @@ void real_main(void) {
                         if (btn_audio_cycle) lv_group_add_obj(g_group, btn_audio_cycle);
                         if (slider) lv_group_add_obj(g_group, slider);
                         if (btn_theme) lv_group_focus_obj(btn_theme);
+                    } else if (active_tab == 2) { // Editor
+                        if (text_editor) lv_group_add_obj(g_group, text_editor);
+                        if (text_editor) lv_group_focus_obj(text_editor);
                     }
                 }
             }
@@ -849,7 +928,7 @@ void real_main(void) {
             if (!button_processed) {
                 uint32_t duration = release_time - press_start_time;
                 if (duration < 800) {
-                    if (active_tab_idx == 3) {
+                    if (active_tab_idx == 4) {
                         // Game Tab active -> Single click flaps instantly, no double-click delay needed!
                         if (!game_active) {
                             // Start/restart game
@@ -888,7 +967,7 @@ void real_main(void) {
             }
         }
 
-        if (waiting_for_double_click && active_tab_idx != 3) {
+        if (waiting_for_double_click && active_tab_idx != 4) {
             uint32_t current_time = time_us_32() / 1000;
             if (current_time - last_click_time >= 350) {
                 // Single click detected! Send LV_EVENT_CLICKED directly to focused widget
