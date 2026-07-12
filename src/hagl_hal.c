@@ -20,20 +20,21 @@
 static hagl_color_t *framebuffer = NULL;
 
 // Pointers to manage the single buffering state
-static hagl_color_t *active_buffer = NULL; // Where HAGL draws
-static hagl_color_t *front_buffer = NULL;  // What is currently on the screen
+hagl_color_t *active_buffer = NULL; // Where HAGL draws
+hagl_color_t *front_buffer = NULL;  // What is currently on the screen
 
 static void __scratch_x("") scanline_callback(uint32_t v_scanline, uint32_t active_line, uint32_t *dst) {
     (void)v_scanline;
 
     int fb_line = active_line / 2; // 2x vertical scale
     int pixel_zero = fb_line * DISPLAY_WIDTH;
-    uint8_t *dst8 = (uint8_t *)dst;
 
-    for (int x = 0; x < DISPLAY_WIDTH; x++) {
-        uint8_t pixel = front_buffer[pixel_zero + x];
-        dst8[x * 2]     = pixel;
-        dst8[x * 2 + 1] = pixel;
+    uint16_t *src16 = (uint16_t *)&front_buffer[pixel_zero];
+    for (int x = 0; x < DISPLAY_WIDTH / 2; x++) {
+        uint16_t pair = src16[x];
+        uint32_t p1 = pair & 0xFF;
+        uint32_t p2 = pair >> 8;
+        dst[x] = p1 | (p1 << 8) | (p2 << 16) | (p2 << 24);
     }
 }
 

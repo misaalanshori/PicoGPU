@@ -32,7 +32,7 @@ SPDX-License-Identifier: MIT-0
 #include "head.h"
 
 static const uint8_t SPEED = 2;
-static const uint8_t PIXEL_SIZE = 2;
+static const uint8_t PIXEL_SIZE = 1;
 
 static uint16_t angle;
 // static float sinlut[360];
@@ -66,7 +66,12 @@ uint8_t rgb565_to_rgb332(uint16_t rgb565) {
     return (r3 << 5) | (g3 << 2) | b2;
 }
 
+#include "hagl_hal.h"
+
 void rotozoom_render(hagl_backend_t const *display) {
+    if (active_buffer == NULL) {
+        return;
+    }
     float s, c, z;
     size_t cs = sizeof(hagl_color_t);
 
@@ -77,7 +82,7 @@ void rotozoom_render(hagl_backend_t const *display) {
     z = s * 1.2f;
 
     for (uint16_t x = 0; x < display->width; x = x + PIXEL_SIZE) {
-        for (uint16_t y = 0; y < display->height; y = y + PIXEL_SIZE) {
+        for (uint16_t y = 20; y < display->height - 20; y = y + PIXEL_SIZE) {
 
             /* Get a rotated pixel from the head image. */
             int16_t u = (int16_t)((x * c - y * s) * z) % HEAD_WIDTH;
@@ -105,11 +110,13 @@ void rotozoom_render(hagl_backend_t const *display) {
             hagl_color_t color = rgb565_to_rgb332(raw_rgb565);
 
             if (1 == PIXEL_SIZE) {
-                hagl_put_pixel(display, x, y, color);
+                active_buffer[y * DISPLAY_WIDTH + x] = color;
             } else {
-                hagl_fill_rectangle(
-                    display, x, y, x + PIXEL_SIZE - 1, y + PIXEL_SIZE - 1, color
-                );
+                uint32_t idx = y * DISPLAY_WIDTH + x;
+                active_buffer[idx] = color;
+                active_buffer[idx + 1] = color;
+                active_buffer[idx + DISPLAY_WIDTH] = color;
+                active_buffer[idx + DISPLAY_WIDTH + 1] = color;
             }
             // hagl_put_pixel(x, y, *color);
         }

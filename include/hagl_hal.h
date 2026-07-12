@@ -23,6 +23,8 @@ extern "C" {
 /** HAL must provide typedef for colors. This HAL uses RGB888. */
 typedef uint8_t hagl_color_t;
 
+extern hagl_color_t *active_buffer;
+
 /**
  * @brief Initialize the backend
  */

@@ -41,6 +41,7 @@ struct ball {
     struct vector2 velocity;
     uint16_t radius;
     uint16_t color;
+    float radius_sq;
 };
 
 struct ball balls[16];
@@ -50,12 +51,13 @@ static const uint8_t MIN_VELOCITY = 3;
 static const uint8_t MAX_VELOCITY = 5;
 static const uint8_t MIN_RADIUS = 22;
 static const uint8_t MAX_RADIUS = 32;
-static const uint8_t PIXEL_SIZE = 2;
+static const uint8_t PIXEL_SIZE = 1;
 
 void metaballs_init(hagl_backend_t const *display) {
     /* Set up imaginary balls inside screen coordinates. */
     for (int16_t i = 0; i < NUM_BALLS; i++) {
         balls[i].radius = (rand() % MAX_RADIUS) + MIN_RADIUS;
+        balls[i].radius_sq = (float)(balls[i].radius * balls[i].radius);
         balls[i].color = 0xffff;
         balls[i].position.x = rand() % display->width;
         balls[i].position.y = rand() % display->height;
@@ -82,44 +84,75 @@ void metaballs_animate(hagl_backend_t const *display) {
 }
 
 /* http://www.geisswerks.com/ryan/BLOBS/blobs.html */
+#include "hagl_hal.h"
+
 void metaballs_render(hagl_backend_t const *display) {
+    if (active_buffer == NULL) {
+        return;
+    }
     const hagl_color_t background = hagl_color(display, 0, 0, 0);
     const hagl_color_t black = hagl_color(display, 0, 0, 0);
     const hagl_color_t white = hagl_color(display, 255, 255, 255);
     const hagl_color_t green = hagl_color(display, 0, 255, 0);
     hagl_color_t color;
 
-    for (uint16_t y = 0; y < display->height; y += PIXEL_SIZE) {
+    // Cache to register-like locals to bypass pointer indexing and float conversion in the loops
+    float bx0 = (float)balls[0].position.x;
+    float by0 = (float)balls[0].position.y;
+    float brsq0 = balls[0].radius_sq;
+
+    float bx1 = (float)balls[1].position.x;
+    float by1 = (float)balls[1].position.y;
+    float brsq1 = balls[1].radius_sq;
+
+    for (uint16_t y = 20; y < display->height - 20; y += PIXEL_SIZE) {
+        float fy = (float)y;
+        float dy0 = fy - by0;
+        float dy1 = fy - by1;
+        float dy0_sq = dy0 * dy0;
+        float dy1_sq = dy1 * dy1;
+        uint32_t row_offset = y * DISPLAY_WIDTH;
+
         for (uint16_t x = 0; x < display->width; x += PIXEL_SIZE) {
-            float sum = 0;
-            for (uint8_t i = 0; i < NUM_BALLS; i++) {
-                const float dx = x - balls[i].position.x;
-                const float dy = y - balls[i].position.y;
-                const float d2 = dx * dx + dy * dy;
-                if (d2 > 0.0f) {
-                    sum += balls[i].radius * balls[i].radius / d2;
-                } else {
-                    sum += 1000.0f;
-                }
-                // sum += balls[i].radius / sqrt(d2);
+            float fx = (float)x;
+            float sum = 0.0f;
+
+            // Ball 0
+            float dx0 = fx - bx0;
+            float d2_0 = dx0 * dx0 + dy0_sq;
+            if (d2_0 > 0.0f) {
+                sum += brsq0 / d2_0;
+            } else {
+                sum += 1000.0f;
             }
 
-            if (sum > 0.65) {
+            // Ball 1
+            float dx1 = fx - bx1;
+            float d2_1 = dx1 * dx1 + dy1_sq;
+            if (d2_1 > 0.0f) {
+                sum += brsq1 / d2_1;
+            } else {
+                sum += 1000.0f;
+            }
+
+            if (sum > 0.65f) {
                 color = black;
-            } else if (sum > 0.5) {
+            } else if (sum > 0.5f) {
                 color = white;
-            } else if (sum > 0.4) {
+            } else if (sum > 0.4f) {
                 color = green;
             } else {
                 color = background;
             }
 
             if (1 == PIXEL_SIZE) {
-                hagl_put_pixel(display, x, y, color);
+                active_buffer[row_offset + x] = color;
             } else {
-                hagl_fill_rectangle(
-                    display, x, y, x + PIXEL_SIZE - 1, y + PIXEL_SIZE - 1, color
-                );
+                uint32_t idx = row_offset + x;
+                active_buffer[idx] = color;
+                active_buffer[idx + 1] = color;
+                active_buffer[idx + DISPLAY_WIDTH] = color;
+                active_buffer[idx + DISPLAY_WIDTH + 1] = color;
             }
         }
     }
