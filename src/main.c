@@ -132,6 +132,11 @@ static lv_obj_t *lbl_timer_val = NULL;
 static lv_obj_t *btn_timer_toggle = NULL;
 static lv_obj_t *btn_timer_mode = NULL;
 
+// Settings Tab Widgets
+static lv_obj_t *btn_theme = NULL;
+static lv_obj_t *btn_audio_cycle = NULL;
+static lv_obj_t *slider = NULL;
+
 static inline int16_t get_sine_sample(void) {
     uint32_t sfx_phase_inc = 0;
     
@@ -439,7 +444,7 @@ void build_ui(void) {
     }
 
     // Button to toggle theme
-    lv_obj_t *btn_theme = lv_button_create(tab2);
+    btn_theme = lv_button_create(tab2);
     if (btn_theme) {
         lv_obj_set_size(btn_theme, 180, 35);
         lv_obj_add_event_cb(btn_theme, theme_btn_event_cb, LV_EVENT_ALL, NULL);
@@ -452,7 +457,7 @@ void build_ui(void) {
     }
 
     // Button to cycle audio mode
-    lv_obj_t *btn_audio_cycle = lv_button_create(tab2);
+    btn_audio_cycle = lv_button_create(tab2);
     if (btn_audio_cycle) {
         lv_obj_set_size(btn_audio_cycle, 220, 35);
         lv_obj_add_event_cb(btn_audio_cycle, audio_cycle_event_cb, LV_EVENT_ALL, NULL);
@@ -464,20 +469,18 @@ void build_ui(void) {
     }
 
     // Dynamic Slider
-    lv_obj_t *slider = lv_slider_create(tab2);
+    slider = lv_slider_create(tab2);
     if (slider) {
         lv_obj_set_size(slider, 200, 10);
         lv_slider_set_value(slider, 50, LV_ANIM_OFF);
     }
 
-    // Add interactive widgets to group for keypad navigation
+    // Add interactive widgets to group for keypad navigation (initially Tab 0 widgets only)
     lv_group_t *g = lv_group_get_default();
     if (g) {
+        lv_group_remove_all_objs(g);
         if (btn_timer_toggle) lv_group_add_obj(g, btn_timer_toggle);
         if (btn_timer_mode) lv_group_add_obj(g, btn_timer_mode);
-        if (btn_theme) lv_group_add_obj(g, btn_theme);
-        if (btn_audio_cycle) lv_group_add_obj(g, btn_audio_cycle);
-        if (slider) lv_group_add_obj(g, slider);
     }
 
     // ==========================================
@@ -690,6 +693,22 @@ void real_main(void) {
                 printf("[main] Long press detected! Switching to tab %d \r\n", active_tab);
                 button_processed = true;
                 waiting_for_double_click = false; // Cancel any pending clicks
+
+                // Dynamically update default group objects depending on active tab
+                lv_group_t *g_group = lv_group_get_default();
+                if (g_group) {
+                    lv_group_remove_all_objs(g_group);
+                    if (active_tab == 0) { // Dashboard (Clock & Pomodoro)
+                        if (btn_timer_toggle) lv_group_add_obj(g_group, btn_timer_toggle);
+                        if (btn_timer_mode) lv_group_add_obj(g_group, btn_timer_mode);
+                        if (btn_timer_toggle) lv_group_focus_obj(btn_timer_toggle);
+                    } else if (active_tab == 1) { // Controls (Settings)
+                        if (btn_theme) lv_group_add_obj(g_group, btn_theme);
+                        if (btn_audio_cycle) lv_group_add_obj(g_group, btn_audio_cycle);
+                        if (slider) lv_group_add_obj(g_group, slider);
+                        if (btn_theme) lv_group_focus_obj(btn_theme);
+                    }
+                }
             }
         }
 
