@@ -95,23 +95,58 @@ static lv_obj_t *lbl_score = NULL;
 static lv_obj_t *lbl_status = NULL;
 static lv_obj_t *tab4 = NULL;
 
+// Ambient Audio Modes
+typedef enum {
+    AUDIO_TETRIS,
+    AUDIO_RAIN,
+    AUDIO_NOISE,
+    AUDIO_SILENT
+} audio_mode_t;
+
+static volatile audio_mode_t current_audio_mode = AUDIO_TETRIS;
+
+// Desktop Clock Variables (Initialized to 2026-07-12 20:51:49)
+static int clock_hours = 20;
+static int clock_minutes = 51;
+static int clock_seconds = 49;
+static int clock_day = 12;
+static int clock_month = 7;
+static int clock_year = 2026;
+
+// Pomodoro & Stopwatch Timer State Machine
+typedef enum {
+    TIMER_MODE_POMODORO,
+    TIMER_MODE_BREAK,
+    TIMER_MODE_STOPWATCH
+} timer_mode_t;
+
+static timer_mode_t current_timer_mode = TIMER_MODE_POMODORO;
+static bool timer_running = false;
+static int timer_seconds = 25 * 60; // 25 minutes default
+
+// UI widgets for Clock & Timer
+static lv_obj_t *lbl_clock_time = NULL;
+static lv_obj_t *lbl_clock_date = NULL;
+static lv_obj_t *lbl_timer_mode = NULL;
+static lv_obj_t *lbl_timer_val = NULL;
+static lv_obj_t *btn_timer_toggle = NULL;
+static lv_obj_t *btn_timer_mode = NULL;
+
 static inline int16_t get_sine_sample(void) {
     uint32_t sfx_phase_inc = 0;
     
+    // SFX always takes highest priority (plays over any ambient noise/music)
     if (current_sfx != SFX_NONE) {
         uint32_t sfx_freq = 0;
         if (current_sfx == SFX_FLAP) {
-            // Ascending flap sweep
-            sfx_freq = 200 + sfx_frame * 80; // 200 to 600 Hz
+            sfx_freq = 200 + sfx_frame * 80;
             sfx_frame++;
             if (sfx_frame > 5) current_sfx = SFX_NONE;
         } else if (current_sfx == SFX_POINT) {
-            // High point chime
             sfx_freq = (sfx_frame < 5) ? 880 : 1046;
             sfx_frame++;
             if (sfx_frame > 10) current_sfx = SFX_NONE;
         } else if (current_sfx == SFX_CRASH) {
-            // Descending buzz
             sfx_freq = 150 - sfx_frame * 7;
             if (sfx_freq < 40) sfx_freq = 40;
             sfx_frame++;
@@ -125,11 +160,26 @@ static inline int16_t get_sine_sample(void) {
         return s;
     }
 
-    // Fallback to background melody if no SFX is active
-    if (phase_increment == 0) return 0;
-    int16_t s = sine_table[(audio_phase >> 24) & 0xFF];
-    audio_phase += phase_increment;
-    return s;
+    // Process active ambient mode
+    if (current_audio_mode == AUDIO_TETRIS) {
+        if (phase_increment == 0) return 0;
+        int16_t s = sine_table[(audio_phase >> 24) & 0xFF];
+        audio_phase += phase_increment;
+        return s;
+    } else if (current_audio_mode == AUDIO_NOISE) {
+        // White Noise: random sample
+        int16_t noise = (int16_t)((rand() % 1600) - 800);
+        return noise;
+    } else if (current_audio_mode == AUDIO_RAIN) {
+        // Rain Sound: low-pass filtered random noise
+        static float lp_history = 0.0f;
+        float raw_noise = (float)((rand() % 2400) - 1200);
+        lp_history = 0.96f * lp_history + 0.04f * raw_noise;
+        return (int16_t)lp_history;
+    }
+
+    // AUDIO_SILENT
+    return 0;
 }
 
 static void generate_audio(void) {
@@ -189,6 +239,86 @@ static void theme_btn_event_cb(lv_event_t *e) {
     }
 }
 
+// Timer Toggle Callback
+static void timer_toggle_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        timer_running = !timer_running;
+        current_sfx = SFX_POINT; // play a quick beep/chime
+        sfx_frame = 0;
+        
+        if (btn_timer_toggle) {
+            lv_obj_t *lbl = lv_obj_get_child(btn_timer_toggle, 0);
+            if (lbl) {
+                lv_label_set_text(lbl, timer_running ? "Pause" : "Start");
+            }
+        }
+        printf("[timer] Toggled timer state: running = %d\r\n", timer_running);
+    }
+}
+
+// Timer Mode Callback
+static void timer_mode_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        current_sfx = SFX_FLAP; // click sound
+        sfx_frame = 0;
+
+        if (timer_running) {
+            // Reset active timer
+            timer_running = false;
+            if (btn_timer_toggle) {
+                lv_obj_t *lbl = lv_obj_get_child(btn_timer_toggle, 0);
+                if (lbl) lv_label_set_text(lbl, "Start");
+            }
+            printf("[timer] Reset active timer.\r\n");
+        } else {
+            // Cycle modes: Pomodoro -> Break -> Stopwatch
+            current_timer_mode = (current_timer_mode + 1) % 3;
+            printf("[timer] Cycled mode to %d\r\n", current_timer_mode);
+        }
+
+        // Reset timer duration according to new mode
+        if (current_timer_mode == TIMER_MODE_POMODORO) {
+            timer_seconds = 25 * 60;
+            if (lbl_timer_mode) lv_label_set_text(lbl_timer_mode, "POMODORO WORK TIMER");
+            if (lbl_timer_val) lv_label_set_text(lbl_timer_val, "25:00");
+        } else if (current_timer_mode == TIMER_MODE_BREAK) {
+            timer_seconds = 5 * 60;
+            if (lbl_timer_mode) lv_label_set_text(lbl_timer_mode, "SHORT BREAK TIMER");
+            if (lbl_timer_val) lv_label_set_text(lbl_timer_val, "05:00");
+        } else if (current_timer_mode == TIMER_MODE_STOPWATCH) {
+            timer_seconds = 0;
+            if (lbl_timer_mode) lv_label_set_text(lbl_timer_mode, "STOPWATCH LAP TIMER");
+            if (lbl_timer_val) lv_label_set_text(lbl_timer_val, "00:00.0");
+        }
+    }
+}
+
+// Audio Mode cycle callback
+static lv_obj_t *lbl_audio_mode = NULL;
+static void audio_cycle_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        current_audio_mode = (current_audio_mode + 1) % 4;
+        current_sfx = SFX_POINT; // click beep
+        sfx_frame = 0;
+
+        if (lbl_audio_mode) {
+            if (current_audio_mode == AUDIO_TETRIS) {
+                lv_label_set_text(lbl_audio_mode, "Audio Mode: Tetris");
+            } else if (current_audio_mode == AUDIO_RAIN) {
+                lv_label_set_text(lbl_audio_mode, "Audio Mode: Rain");
+            } else if (current_audio_mode == AUDIO_NOISE) {
+                lv_label_set_text(lbl_audio_mode, "Audio Mode: Noise");
+            } else {
+                lv_label_set_text(lbl_audio_mode, "Audio Mode: Silent");
+            }
+        }
+        printf("[audio] Cycled audio mode to %d\r\n", current_audio_mode);
+    }
+}
+
 void build_ui(void) {
     // Create tabview
     tabview = lv_tabview_create(lv_screen_active());
@@ -210,42 +340,92 @@ void build_ui(void) {
     }
 
     // ==========================================
-    // Tab 1: Dashboard
+    // Tab 1: Dashboard (Clock & Pomodoro)
     // ==========================================
     lv_obj_set_flex_flow(tab1, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(tab1, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(tab1, 10, 0);
 
-    lv_obj_t *title = lv_label_create(tab1);
-    if (title) {
-        lv_label_set_text(title, "PicoHDMI + LVGL 9.5");
-        lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    // Large digital clock
+    lbl_clock_time = lv_label_create(tab1);
+    if (lbl_clock_time) {
+        lv_label_set_text(lbl_clock_time, "20:51:49");
+        lv_obj_set_style_text_font(lbl_clock_time, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_margin_bottom(lbl_clock_time, 5, 0);
     }
 
-    lv_obj_t *desc = lv_label_create(tab1);
-    if (desc) {
-        lv_label_set_text(desc, "Press GPIO 23 button to switch tabs!");
-        lv_obj_set_style_text_color(desc, lv_palette_main(LV_PALETTE_GREY), 0);
+    // Date
+    lbl_clock_date = lv_label_create(tab1);
+    if (lbl_clock_date) {
+        lv_label_set_text(lbl_clock_date, "Sunday, July 12, 2026");
+        lv_obj_set_style_text_color(lbl_clock_date, lv_palette_main(LV_PALETTE_GREY), 0);
+        lv_obj_set_style_margin_bottom(lbl_clock_date, 15, 0);
     }
 
-    // Progress Bar showing animated progress
-    progress_bar = lv_bar_create(tab1);
-    if (progress_bar) {
-        lv_obj_set_size(progress_bar, 280, 15);
-        lv_bar_set_value(progress_bar, 0, LV_ANIM_OFF);
+    // Separator line
+    lv_obj_t *sep = lv_obj_create(tab1);
+    if (sep) {
+        lv_obj_set_size(sep, 300, 2);
+        lv_obj_set_style_bg_color(sep, lv_palette_main(LV_PALETTE_GREY), 0);
+        lv_obj_set_style_bg_opa(sep, LV_OPA_30, 0);
+        lv_obj_set_style_border_width(sep, 0, 0);
+        lv_obj_set_style_margin_bottom(sep, 15, 0);
     }
 
-    // Animated Arc
-    cpu_arc = lv_arc_create(tab1);
-    if (cpu_arc) {
-        lv_obj_set_size(cpu_arc, 80, 80);
-        lv_arc_set_rotation(cpu_arc, 135);
-        lv_arc_set_bg_angles(cpu_arc, 0, 270);
-        lv_arc_set_value(cpu_arc, 10);
+    // Timer Mode Title
+    lbl_timer_mode = lv_label_create(tab1);
+    if (lbl_timer_mode) {
+        lv_label_set_text(lbl_timer_mode, "POMODORO WORK TIMER");
+        lv_obj_set_style_text_font(lbl_timer_mode, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(lbl_timer_mode, lv_palette_main(LV_PALETTE_AMBER), 0);
+    }
+
+    // Timer Value
+    lbl_timer_val = lv_label_create(tab1);
+    if (lbl_timer_val) {
+        lv_label_set_text(lbl_timer_val, "25:00");
+        lv_obj_set_style_text_font(lbl_timer_val, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_margin_bottom(lbl_timer_val, 10, 0);
+    }
+
+    // Timer Buttons Container
+    lv_obj_t *btn_container = lv_obj_create(tab1);
+    if (btn_container) {
+        lv_obj_set_size(btn_container, 300, 50);
+        lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(btn_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(btn_container, 0, 0);
+        lv_obj_set_style_bg_opa(btn_container, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(btn_container, 0, 0);
+        lv_obj_remove_flag(btn_container, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Toggle Button
+        btn_timer_toggle = lv_button_create(btn_container);
+        if (btn_timer_toggle) {
+            lv_obj_set_size(btn_timer_toggle, 100, 35);
+            lv_obj_add_event_cb(btn_timer_toggle, timer_toggle_event_cb, LV_EVENT_ALL, NULL);
+            lv_obj_t *lbl_toggle = lv_label_create(btn_timer_toggle);
+            if (lbl_toggle) {
+                lv_label_set_text(lbl_toggle, "Start");
+                lv_obj_center(lbl_toggle);
+            }
+        }
+
+        // Mode / Reset Button
+        btn_timer_mode = lv_button_create(btn_container);
+        if (btn_timer_mode) {
+            lv_obj_set_size(btn_timer_mode, 120, 35);
+            lv_obj_add_event_cb(btn_timer_mode, timer_mode_event_cb, LV_EVENT_ALL, NULL);
+            lv_obj_t *lbl_mode = lv_label_create(btn_timer_mode);
+            if (lbl_mode) {
+                lv_label_set_text(lbl_mode, "Reset/Mode");
+                lv_obj_center(lbl_mode);
+            }
+        }
     }
 
     // ==========================================
-    // Tab 2: Controls
+    // Tab 2: Controls (Settings & Audio)
     // ==========================================
     lv_obj_set_flex_flow(tab2, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(tab2, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -253,20 +433,33 @@ void build_ui(void) {
 
     lv_obj_t *ctrl_title = lv_label_create(tab2);
     if (ctrl_title) {
-        lv_label_set_text(ctrl_title, "Interactive Control");
+        lv_label_set_text(ctrl_title, "System Settings");
         lv_obj_set_style_text_font(ctrl_title, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_margin_bottom(ctrl_title, 10, 0);
     }
 
     // Button to toggle theme
     lv_obj_t *btn_theme = lv_button_create(tab2);
     if (btn_theme) {
-        lv_obj_set_size(btn_theme, 180, 40);
+        lv_obj_set_size(btn_theme, 180, 35);
         lv_obj_add_event_cb(btn_theme, theme_btn_event_cb, LV_EVENT_ALL, NULL);
 
         lv_obj_t *btn_theme_label = lv_label_create(btn_theme);
         if (btn_theme_label) {
             lv_label_set_text(btn_theme_label, "Toggle Theme");
             lv_obj_center(btn_theme_label);
+        }
+    }
+
+    // Button to cycle audio mode
+    lv_obj_t *btn_audio_cycle = lv_button_create(tab2);
+    if (btn_audio_cycle) {
+        lv_obj_set_size(btn_audio_cycle, 220, 35);
+        lv_obj_add_event_cb(btn_audio_cycle, audio_cycle_event_cb, LV_EVENT_ALL, NULL);
+        lbl_audio_mode = lv_label_create(btn_audio_cycle);
+        if (lbl_audio_mode) {
+            lv_label_set_text(lbl_audio_mode, "Audio Mode: Tetris");
+            lv_obj_center(lbl_audio_mode);
         }
     }
 
@@ -280,7 +473,10 @@ void build_ui(void) {
     // Add interactive widgets to group for keypad navigation
     lv_group_t *g = lv_group_get_default();
     if (g) {
+        if (btn_timer_toggle) lv_group_add_obj(g, btn_timer_toggle);
+        if (btn_timer_mode) lv_group_add_obj(g, btn_timer_mode);
         if (btn_theme) lv_group_add_obj(g, btn_theme);
+        if (btn_audio_cycle) lv_group_add_obj(g, btn_audio_cycle);
         if (slider) lv_group_add_obj(g, slider);
     }
 
@@ -648,6 +844,79 @@ void real_main(void) {
             }
         }
 
+        // 1 Hz Desktop Clock and Pomodoro Timer tick
+        static uint32_t last_clock_update = 0;
+        uint32_t now_ms_clock = time_us_32() / 1000;
+        if (now_ms_clock - last_clock_update >= 1000) {
+            last_clock_update = now_ms_clock;
+
+            // 1. Advance Clock
+            clock_seconds++;
+            if (clock_seconds >= 60) {
+                clock_seconds = 0;
+                clock_minutes++;
+                if (clock_minutes >= 60) {
+                    clock_minutes = 0;
+                    clock_hours++;
+                    if (clock_hours >= 24) {
+                        clock_hours = 0;
+                        clock_day++;
+                        if (clock_day > 30) {
+                            clock_day = 1;
+                            clock_month++;
+                            if (clock_month > 12) {
+                                clock_month = 1;
+                                clock_year++;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update clock labels on screen
+            if (lbl_clock_time) {
+                char str_time[32];
+                snprintf(str_time, sizeof(str_time), "%02d:%02d:%02d", clock_hours, clock_minutes, clock_seconds);
+                lv_label_set_text(lbl_clock_time, str_time);
+            }
+
+            if (lbl_clock_date) {
+                char str_date[64];
+                snprintf(str_date, sizeof(str_date), "Sunday, %02d/%02d/%04d", clock_day, clock_month, clock_year);
+                lv_label_set_text(lbl_clock_date, str_date);
+            }
+
+            // 2. Advance Pomodoro / Stopwatch timer
+            if (timer_running) {
+                if (current_timer_mode == TIMER_MODE_POMODORO || current_timer_mode == TIMER_MODE_BREAK) {
+                    timer_seconds--;
+                    if (timer_seconds <= 0) {
+                        timer_seconds = 0;
+                        timer_running = false;
+                        
+                        // Play alert sound (point SFX)
+                        current_sfx = SFX_POINT;
+                        sfx_frame = 0;
+                        
+                        if (btn_timer_toggle) {
+                            lv_obj_t *lbl = lv_obj_get_child(btn_timer_toggle, 0);
+                            if (lbl) lv_label_set_text(lbl, "Start");
+                        }
+                        printf("[timer] Time's up!\r\n");
+                    }
+                } else if (current_timer_mode == TIMER_MODE_STOPWATCH) {
+                    timer_seconds++;
+                }
+
+                // Update timer label on screen
+                if (lbl_timer_val) {
+                    char str_timer[32];
+                    snprintf(str_timer, sizeof(str_timer), "%02d:%02d", timer_seconds / 60, timer_seconds % 60);
+                    lv_label_set_text(lbl_timer_val, str_timer);
+                }
+            }
+        }
+
         // Perform frame-level melody updates
         if (video_frame_count != last_frame) {
             last_frame = video_frame_count;
@@ -665,24 +934,6 @@ void real_main(void) {
         tick_counter++;
         if ((tick_counter % 5000) == 0) {
             printf("[main] loop heartbeat: ticks=%u frames=%u\r\n", (unsigned int)tick_counter, (unsigned int)video_frame_count);
-        }
-        if ((tick_counter % 17) == 0) {
-            // Animate Progress Bar
-            if (progress_bar) {
-                static int progress_val = 0;
-                progress_val = (progress_val + 1) % 101;
-                lv_bar_set_value(progress_bar, progress_val, LV_ANIM_ON);
-            }
-
-            // Animate Arc
-            if (cpu_arc) {
-                static int arc_val = 10;
-                static int arc_dir = 1;
-                arc_val += arc_dir * 2;
-                if (arc_val >= 90) { arc_val = 90; arc_dir = -1; }
-                if (arc_val <= 10) { arc_val = 10; arc_dir = 1; }
-                lv_arc_set_value(cpu_arc, arc_val);
-            }
         }
 
         if ((tick_counter % 32) == 0) {
