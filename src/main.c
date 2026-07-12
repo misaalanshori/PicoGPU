@@ -273,7 +273,30 @@ int main(void)
     volatile uint32_t *flash_ptr = (volatile uint32_t *)0x10000000;
     (void)*flash_ptr;
 
-    set_sys_clock_khz(372000, true);
+    set_sys_clock_khz(384000, true);
+
+    clock_configure(
+        clk_usb,
+        0, // clk_usb does not have a primary glitchless multiplexer
+        CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+        384 * MHZ,
+        48 * MHZ);
+
+    clock_configure(
+        clk_adc,
+        0,
+        CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+        384 * MHZ,
+        48 * MHZ);
+
+    pll_init(pll_usb, 1, 1008 * MHZ, 4, 2);
+ 
+    clock_configure(
+        clk_hstx,
+        0,
+        CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+        126 * MHZ,
+        126 * MHZ);
 
     sleep_ms(2500);
 

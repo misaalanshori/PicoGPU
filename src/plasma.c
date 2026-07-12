@@ -32,8 +32,8 @@ SPDX-License-Identifier: MIT-0
 
 #include "plasma.h"
 
-hagl_color_t *palette;
-uint8_t *plasma;
+hagl_color_t *palette = NULL;
+uint8_t *plasma = NULL;
 
 static const uint8_t SPEED = 4;
 static const uint8_t PIXEL_SIZE = 1;
@@ -94,35 +94,26 @@ void plasma_render(hagl_backend_t const *display) {
             /* Get a color for pixel from the plasma buffer. */
             const uint8_t index = *(ptr++);
             const hagl_color_t color = palette[index];
-            /* Put a pixel to the display. */
-            if (1 == PIXEL_SIZE) {
-                active_buffer[row_offset + x] = color;
-            } else {
-                uint32_t idx = row_offset + x;
-                active_buffer[idx] = color;
-                active_buffer[idx + 1] = color;
-                active_buffer[idx + DISPLAY_WIDTH] = color;
-                active_buffer[idx + DISPLAY_WIDTH + 1] = color;
-            }
+            active_buffer[row_offset + x] = color;
         }
     }
 }
 
 void plasma_animate(hagl_backend_t const *display) {
+    if (plasma == NULL) {
+        return;
+    }
     uint8_t *ptr = plasma;
-
-    for (uint16_t y = 20; y < display->height - 20; y = y + PIXEL_SIZE) {
-        for (uint16_t x = 0; x < display->width; x = x + PIXEL_SIZE) {
-            /* Get a color from plasma and choose the next color. */
-            /* Unsigned integers wrap automatically. */
-            const uint8_t index = *ptr + SPEED;
-            /* Put the new color back to the plasma buffer. */
-            *(ptr++) = index;
-        }
+    size_t plasma_size = (display->width / PIXEL_SIZE) * ((display->height - 40) / PIXEL_SIZE);
+    for (size_t i = 0; i < plasma_size; i++) {
+        *ptr = *ptr + SPEED;
+        ptr++;
     }
 }
 
 void plasma_close() {
     free(plasma);
+    plasma = NULL;
     free(palette);
+    palette = NULL;
 }

@@ -140,10 +140,11 @@ void deform_render(hagl_backend_t const *display) {
                 active_buffer[row_offset + x] = color;
             } else {
                 uint32_t idx = row_offset + x;
-                active_buffer[idx] = color;
-                active_buffer[idx + 1] = color;
-                active_buffer[idx + DISPLAY_WIDTH] = color;
-                active_buffer[idx + DISPLAY_WIDTH + 1] = color;
+                for (int dy = 0; dy < PIXEL_SIZE; dy++) {
+                    for (int dx = 0; dx < PIXEL_SIZE; dx++) {
+                        active_buffer[idx + dy * DISPLAY_WIDTH + dx] = color;
+                    }
+                }
             }
         }
     }

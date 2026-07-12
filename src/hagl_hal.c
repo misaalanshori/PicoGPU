@@ -26,15 +26,17 @@ hagl_color_t *front_buffer = NULL;  // What is currently on the screen
 static void __scratch_x("") scanline_callback(uint32_t v_scanline, uint32_t active_line, uint32_t *dst) {
     (void)v_scanline;
 
-    int fb_line = active_line / 2; // 2x vertical scale
-    int pixel_zero = fb_line * DISPLAY_WIDTH;
-
-    uint16_t *src16 = (uint16_t *)&front_buffer[pixel_zero];
-    for (int x = 0; x < DISPLAY_WIDTH / 2; x++) {
-        uint16_t pair = src16[x];
-        uint32_t p1 = pair & 0xFF;
-        uint32_t p2 = pair >> 8;
-        dst[x] = p1 | (p1 << 8) | (p2 << 16) | (p2 << 24);
+    if (active_line < 60 || active_line >= 420) {
+        for (int x = 0; x < DISPLAY_WIDTH / 4; x++) {
+            dst[x] = 0;
+        }
+    } else {
+        int fb_line = active_line - 60;
+        int pixel_zero = fb_line * DISPLAY_WIDTH;
+        uint32_t *src32 = (uint32_t *)&front_buffer[pixel_zero];
+        for (int x = 0; x < DISPLAY_WIDTH / 4; x++) {
+            dst[x] = src32[x];
+        }
     }
 }
 
@@ -73,8 +75,8 @@ void hagl_hal_init(hagl_backend_t *backend)
 
     // Initialize HDMI output — rt variant
     hstx_di_queue_init();
-    video_output_set_mode(&video_mode_720_p);
-    video_output_init(DISPLAY_WIDTH * 2, DISPLAY_HEIGHT * 2);
+    video_output_set_mode(&video_mode_480_p);
+    video_output_init(640, 480);
 
     // Register scanline callback
     video_output_set_scanline_callback(scanline_callback);
