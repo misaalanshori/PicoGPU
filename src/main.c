@@ -728,6 +728,21 @@ static inline Vec3 vec3_cross(Vec3 a, Vec3 b) {
     };
 }
 
+// Fast pow(x, 32) using squaring (only 5 multiplications)
+static inline float fast_pow32(float x) {
+    float x2 = x * x;
+    float x4 = x2 * x2;
+    float x8 = x4 * x4;
+    float x16 = x8 * x8;
+    return x16 * x16;
+}
+
+// Fast pow(x, 64) using squaring (only 6 multiplications)
+static inline float fast_pow64(float x) {
+    float p32 = fast_pow32(x);
+    return p32 * p32;
+}
+
 // Algebraic Ray-Sphere Intersection
 static inline float intersect_sphere(Ray r, Vec3 center, float radius) {
     Vec3 oc = vec3_sub(r.origin, center);
@@ -832,8 +847,8 @@ Vec3 trace_ray(Ray r, int depth) {
         Vec3 reflect_color = trace_ray((Ray){vec3_add(hit_pos, vec3_mul(N, 0.001f)), vec3_sub(r.dir, vec3_mul(N, 2.0f * vec3_dot(r.dir, N)))}, depth + 1);
         
         Vec3 glass_base = vec3_add(vec3_mul(reflect_color, fresnel), vec3_mul(refract_color, 1.0f - fresnel));
-        float gs1 = (!in_shadow) ? powf(vec3_dot(N, vec3_normalize(vec3_add(L, vec3_normalize(vec3_mul(r.dir, -1.0f))))), 64.0f) * 0.8f : 0.0f;
-        float gs2 = (!in_shadow2) ? powf(vec3_dot(N, vec3_normalize(vec3_add(L2, vec3_normalize(vec3_mul(r.dir, -1.0f))))), 64.0f) * 0.8f : 0.0f;
+        float gs1 = (!in_shadow) ? fast_pow64(fmaxf(0.0f, vec3_dot(N, vec3_normalize(vec3_add(L, vec3_normalize(vec3_mul(r.dir, -1.0f))))))) * 0.8f : 0.0f;
+        float gs2 = (!in_shadow2) ? fast_pow64(fmaxf(0.0f, vec3_dot(N, vec3_normalize(vec3_add(L2, vec3_normalize(vec3_mul(r.dir, -1.0f))))))) * 0.8f : 0.0f;
         return vec3_add(glass_base, (Vec3){gs1 + gs2 * rain_light_color.x * attenuation, gs1 + gs2 * rain_light_color.y * attenuation, gs1 + gs2 * rain_light_color.z * attenuation});
     }
     
@@ -863,10 +878,10 @@ Vec3 trace_ray(Ray r, int depth) {
     
     float diffuse_factor = fmaxf(0.0f, vec3_dot(N, L));
     float light_intensity = in_shadow ? 0.15f : (0.15f + 0.85f * diffuse_factor);
-    float spec_factor = (!in_shadow && specular > 0.0f) ? powf(fmaxf(0.0f, vec3_dot(N, vec3_normalize(vec3_add(L, vec3_normalize(vec3_mul(r.dir, -1.0f)))))), 32.0f) * specular : 0.0f;
+    float spec_factor = (!in_shadow && specular > 0.0f) ? fast_pow32(fmaxf(0.0f, vec3_dot(N, vec3_normalize(vec3_add(L, vec3_normalize(vec3_mul(r.dir, -1.0f))))))) * specular : 0.0f;
     
     float diffuse2 = (!in_shadow2) ? fmaxf(0.0f, vec3_dot(N, L2)) : 0.0f;
-    float spec_factor2 = (!in_shadow2 && specular > 0.0f) ? powf(fmaxf(0.0f, vec3_dot(N, vec3_normalize(vec3_add(L2, vec3_normalize(vec3_mul(r.dir, -1.0f)))))), 32.0f) * specular : 0.0f;
+    float spec_factor2 = (!in_shadow2 && specular > 0.0f) ? fast_pow32(fmaxf(0.0f, vec3_dot(N, vec3_normalize(vec3_add(L2, vec3_normalize(vec3_mul(r.dir, -1.0f))))))) * specular : 0.0f;
     
     Vec3 lit_color = vec3_add(vec3_mul(base_color, light_intensity), (Vec3){spec_factor, spec_factor, spec_factor});
     Vec3 lit2_base = vec3_add(vec3_mul(base_color, diffuse2), (Vec3){spec_factor2, spec_factor2, spec_factor2});
@@ -881,13 +896,12 @@ Vec3 trace_ray(Ray r, int depth) {
     return lit_color;
 }
 
-// 3D Raytracer main loop renderer
+// 3D Raytracer main loop renderer (renders entire frame on Core 0)
 void update_raytracer_simulation(void) {
     if (!img_water) return;
     
     rt_light_angle += 0.04f; // Orbiting light speed
     
-    // Camera orbit parameters
     static float rt_cam_angle = 0.0f;
     rt_cam_angle += 0.015f; // Slow camera orbit
     
@@ -913,7 +927,6 @@ void update_raytracer_simulation(void) {
     uint16_t *pixels = (uint16_t *)water_pixel_buf;
     
     for (int y = 0; y < WATER_H; y++) {
-        // Project screen height coordinate, keeping correct aspect ratio
         float screen_y = 0.5f - (float)y / (float)WATER_H;
         screen_y *= ((float)WATER_H / (float)WATER_W);
         
