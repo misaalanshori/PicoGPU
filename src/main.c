@@ -604,7 +604,7 @@ void build_ui(void) {
     // Info Labels
     lv_obj_t *lbl_mcu = lv_label_create(tab3);
     if (lbl_mcu) {
-        lv_label_set_text(lbl_mcu, "MCU: Raspberry Pi RP2350 @ 252 MHz");
+        lv_label_set_text(lbl_mcu, "MCU: Raspberry Pi RP2350 @ 384 MHz");
     }
 
     lv_obj_t *lbl_signal = lv_label_create(tab3);
@@ -707,9 +707,40 @@ void real_main(void) {
     gpio_set_dir(24, GPIO_OUT);
     gpio_put(24, true);
 
-    // Set system clock to 252 MHz (safe, nominal timing for 640x480p60 HDMI)
-    // No vreg voltage elevation or QMI flash overrides required.
-    set_sys_clock_khz(252000, true);
+    // Overclocking RP2350 core & flash to run at 384 MHz,
+    // decoupling clk_hstx to USB PLL running at 126 MHz.
+    vreg_set_voltage(VREG_VOLTAGE_1_30);
+    sleep_ms(20);
+
+    qmi_hw->m[0].timing = (qmi_hw->m[0].timing & ~0xFF) | 4;
+
+    volatile uint32_t *flash_ptr = (volatile uint32_t *)0x10000000;
+    (void)*flash_ptr;
+
+    set_sys_clock_khz(384000, true);
+
+    clock_configure(
+        clk_usb,
+        0, // clk_usb does not have a primary glitchless multiplexer
+        CLOCKS_CLK_USB_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+        384 * MHZ,
+        48 * MHZ);
+
+    clock_configure(
+        clk_adc,
+        0,
+        CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,
+        384 * MHZ,
+        48 * MHZ);
+
+    pll_init(pll_usb, 1, 1008 * MHZ, 4, 2);
+ 
+    clock_configure(
+        clk_hstx,
+        0,
+        CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
+        126 * MHZ,
+        126 * MHZ);
 
     sleep_ms(2500);
     stdio_init_all();
