@@ -157,6 +157,27 @@ static const lv_image_dsc_t water_img_dsc = {
     .data = water_pixel_buf,
 };
 
+// Demo Menu & State Machine
+typedef enum {
+    DEMO_MENU,
+    DEMO_WATER,
+    DEMO_PIPES
+} demo_state_t;
+
+static demo_state_t current_demo_state = DEMO_MENU;
+static lv_obj_t *menu_container = NULL;
+static lv_obj_t *btn_demo_water = NULL;
+static lv_obj_t *btn_demo_pipes = NULL;
+
+// 3D Pipes Screensaver variables
+static bool pipes_occupied[16 * 9] = {false};
+static int ps_pipe_x = 0;
+static int ps_pipe_y = 0;
+static int ps_pipe_dir = 0;
+static uint16_t ps_pipe_base_color = 0;
+static int ps_pipe_length = 0;
+static bool ps_pipe_active = false;
+
 // Toast notification variables
 static lv_obj_t *toast_label = NULL;
 static uint32_t toast_hide_time = 0;
@@ -249,6 +270,247 @@ static uint32_t audio_rand_seed = 0x12345678;
 static inline uint32_t fast_rand(void) {
     audio_rand_seed = audio_rand_seed * 1103515245 + 12345;
     return audio_rand_seed;
+}
+
+// Shading function using integer math (scale_256: 0 to 256)
+static inline uint16_t shade_color_rgb565(uint16_t color, uint32_t scale_256) {
+    uint32_t r = (color >> 11) & 0x1F;
+    uint32_t g = (color >> 5) & 0x3F;
+    uint32_t b = color & 0x1F;
+    
+    r = (r * scale_256) >> 8;
+    g = (g * scale_256) >> 8;
+    b = (b * scale_256) >> 8;
+    
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Draw horizontal pipe cylinder (width G=8, thickness T=6)
+void draw_pipe_segment_horizontal(int x1, int x2, int y_center, uint16_t color) {
+    uint16_t *pixels = (uint16_t *)water_pixel_buf;
+    int start_x = (x1 < x2) ? x1 : x2;
+    int end_x = (x1 < x2) ? x2 : x1;
+    
+    static const uint16_t shade_table[6] = {80, 180, 256, 256, 180, 80};
+    
+    for (int dy = -3; dy <= 2; dy++) {
+        int py = y_center + dy;
+        if (py < 0 || py >= WATER_H) continue;
+        uint16_t shaded = shade_color_rgb565(color, shade_table[dy + 3]);
+        
+        for (int px = start_x; px <= end_x; px++) {
+            if (px >= 0 && px < WATER_W) {
+                pixels[py * WATER_W + px] = shaded;
+            }
+        }
+    }
+}
+
+// Draw vertical pipe cylinder (width G=8, thickness T=6)
+void draw_pipe_segment_vertical(int y1, int y2, int x_center, uint16_t color) {
+    uint16_t *pixels = (uint16_t *)water_pixel_buf;
+    int start_y = (y1 < y2) ? y1 : y2;
+    int end_y = (y1 < y2) ? y2 : y1;
+    
+    static const uint16_t shade_table[6] = {80, 180, 256, 256, 180, 80};
+    
+    for (int dx = -3; dx <= 2; dx++) {
+        int px = x_center + dx;
+        if (px < 0 || px >= WATER_W) continue;
+        uint16_t shaded = shade_color_rgb565(color, shade_table[dx + 3]);
+        
+        for (int py = start_y; py <= end_y; py++) {
+            if (py >= 0 && py < WATER_H) {
+                pixels[py * WATER_W + px] = shaded;
+            }
+        }
+    }
+}
+
+// Draw 3D ball joint (sphere) at turning/endpoints
+void draw_pipe_joint(int cx, int cy, uint16_t color) {
+    uint16_t *pixels = (uint16_t *)water_pixel_buf;
+    static const uint16_t radial_shade[4] = {256, 220, 150, 70};
+    
+    for (int dy = -3; dy <= 3; dy++) {
+        int py = cy + dy;
+        if (py < 0 || py >= WATER_H) continue;
+        
+        for (int dx = -3; dx <= 3; dx++) {
+            int px = cx + dx;
+            if (px < 0 || px >= WATER_W) continue;
+            
+            int dist2 = dx*dx + dy*dy;
+            if (dist2 <= 9) {
+                int dist = 0;
+                if (dist2 > 4) dist = 3;
+                else if (dist2 > 1) dist = 2;
+                else if (dist2 > 0) dist = 1;
+                
+                uint16_t shaded = shade_color_rgb565(color, radial_shade[dist]);
+                pixels[py * WATER_W + px] = shaded;
+            }
+        }
+    }
+}
+
+// Re-init pipes screensaver map
+void init_pipes_game(void) {
+    memset(pipes_occupied, 0, sizeof(pipes_occupied));
+    memset(water_pixel_buf, 0, sizeof(water_pixel_buf));
+    ps_pipe_active = false;
+    printf("[pipes] Game grid initialized\r\n");
+}
+
+// 3D Pipes Screensaver simulation step
+void update_pipes_simulation(void) {
+    if (!img_water) return;
+    
+    static const uint16_t pipe_colors[] = {
+        0xF800, // Red
+        0x07E0, // Green
+        0x001F, // Blue
+        0xFFE0, // Yellow
+        0xF81F, // Magenta
+        0x07FF, // Cyan
+        0xFD20, // Orange
+        0x780F  // Purple
+    };
+    
+    if (!ps_pipe_active) {
+        int start_cell = fast_rand() % (16 * 9);
+        int attempts = 0;
+        while (pipes_occupied[start_cell] && attempts < 50) {
+            start_cell = fast_rand() % (16 * 9);
+            attempts++;
+        }
+        
+        if (attempts >= 50) {
+            init_pipes_game();
+            return;
+        }
+        
+        ps_pipe_x = start_cell % 16;
+        ps_pipe_y = start_cell / 16;
+        pipes_occupied[start_cell] = true;
+        ps_pipe_base_color = pipe_colors[fast_rand() % 8];
+        ps_pipe_dir = fast_rand() % 4;
+        ps_pipe_active = true;
+        ps_pipe_length = 0;
+        
+        draw_pipe_joint(ps_pipe_x * 8 + 4, ps_pipe_y * 8 + 4, ps_pipe_base_color);
+    }
+    
+    int cx = ps_pipe_x * 8 + 4;
+    int cy = ps_pipe_y * 8 + 4;
+    
+    if (fast_rand() % 100 < 25) {
+        int turn = (fast_rand() % 2 == 0) ? 1 : 3;
+        ps_pipe_dir = (ps_pipe_dir + turn) % 4;
+        draw_pipe_joint(cx, cy, ps_pipe_base_color);
+    }
+    
+    int next_x = ps_pipe_x;
+    int next_y = ps_pipe_y;
+    if (ps_pipe_dir == 0) next_x++;
+    else if (ps_pipe_dir == 1) next_y++;
+    else if (ps_pipe_dir == 2) next_x--;
+    else if (ps_pipe_dir == 3) next_y--;
+    
+    bool blocked = false;
+    if (next_x < 0 || next_x >= 16 || next_y < 0 || next_y >= 9) {
+        blocked = true;
+    } else {
+        int idx = next_y * 16 + next_x;
+        if (pipes_occupied[idx]) {
+            blocked = true;
+        }
+    }
+    
+    if (blocked) {
+        draw_pipe_joint(cx, cy, ps_pipe_base_color);
+        ps_pipe_active = false;
+    } else {
+        int ncx = next_x * 8 + 4;
+        int ncy = next_y * 8 + 4;
+        
+        if (ps_pipe_dir == 0 || ps_pipe_dir == 2) {
+            draw_pipe_segment_horizontal(cx, ncx, cy, ps_pipe_base_color);
+        } else {
+            draw_pipe_segment_vertical(cy, ncy, cx, ps_pipe_base_color);
+        }
+        
+        ps_pipe_x = next_x;
+        ps_pipe_y = next_y;
+        pipes_occupied[ps_pipe_y * 16 + ps_pipe_x] = true;
+        ps_pipe_length++;
+        
+        if (ps_pipe_length >= 20) {
+            draw_pipe_joint(ncx, ncy, ps_pipe_base_color);
+            ps_pipe_active = false;
+        }
+    }
+    
+    lv_obj_invalidate(img_water);
+}
+
+// Menu Click Callback - Water Sim
+static void demo_water_click_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        current_demo_state = DEMO_WATER;
+        if (menu_container) lv_obj_add_flag(menu_container, LV_OBJ_FLAG_HIDDEN);
+        if (img_water) lv_obj_remove_flag(img_water, LV_OBJ_FLAG_HIDDEN);
+        
+        lv_group_t *g = lv_group_get_default();
+        if (g) lv_group_remove_all_objs(g);
+        
+        memset(water_buf1, 0, sizeof(water_buf1));
+        memset(water_buf2, 0, sizeof(water_buf2));
+        memset(water_pixel_buf, 0, sizeof(water_pixel_buf));
+        
+        current_sfx = SFX_POINT;
+        sfx_frame = 0;
+        printf("[demo] Switched to Water Simulation\r\n");
+    }
+}
+
+// Menu Click Callback - Pipes Sim
+static void demo_pipes_click_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        current_demo_state = DEMO_PIPES;
+        if (menu_container) lv_obj_add_flag(menu_container, LV_OBJ_FLAG_HIDDEN);
+        if (img_water) lv_obj_remove_flag(img_water, LV_OBJ_FLAG_HIDDEN);
+        
+        lv_group_t *g = lv_group_get_default();
+        if (g) lv_group_remove_all_objs(g);
+        
+        init_pipes_game();
+        
+        current_sfx = SFX_POINT;
+        sfx_frame = 0;
+        printf("[demo] Switched to Pipes Screensaver\r\n");
+    }
+}
+
+// Exit running simulation back to list menu
+void exit_demo_to_menu(void) {
+    current_demo_state = DEMO_MENU;
+    if (menu_container) lv_obj_remove_flag(menu_container, LV_OBJ_FLAG_HIDDEN);
+    if (img_water) lv_obj_add_flag(img_water, LV_OBJ_FLAG_HIDDEN);
+    
+    lv_group_t *g = lv_group_get_default();
+    if (g) {
+        lv_group_remove_all_objs(g);
+        if (btn_demo_water) lv_group_add_obj(g, btn_demo_water);
+        if (btn_demo_pipes) lv_group_add_obj(g, btn_demo_pipes);
+        if (btn_demo_water) lv_group_focus_obj(btn_demo_water);
+    }
+    
+    current_sfx = SFX_POINT;
+    sfx_frame = 0;
+    printf("[demo] Exited to Demo Menu\r\n");
 }
 
 // Procedural mosaic pool tiles generator
@@ -743,17 +1005,61 @@ void build_ui(void) {
     }
 
     // ==========================================
-    // Tab: Demo (2D Water Ripple Simulation)
+    // Tab: Demo (Menu & Graphic Demos)
     // ==========================================
     lv_obj_remove_flag(tab_demo, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_all(tab_demo, 0, 0);
+    lv_obj_set_style_pad_all(tab_demo, 10, 0);
 
+    // Menu Container
+    menu_container = lv_obj_create(tab_demo);
+    if (menu_container) {
+        lv_obj_set_size(menu_container, 620, 260);
+        lv_obj_align(menu_container, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_flex_flow(menu_container, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(menu_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(menu_container, 10, 0);
+        
+        lv_obj_t *menu_title = lv_label_create(menu_container);
+        if (menu_title) {
+            lv_label_set_text(menu_title, "Select Graphic Demo");
+            lv_obj_set_style_text_font(menu_title, &lv_font_montserrat_18, 0);
+            lv_obj_set_style_margin_bottom(menu_title, 15, 0);
+        }
+        
+        // Water button
+        btn_demo_water = lv_button_create(menu_container);
+        if (btn_demo_water) {
+            lv_obj_set_size(btn_demo_water, 240, 35);
+            lv_obj_add_event_cb(btn_demo_water, demo_water_click_cb, LV_EVENT_ALL, NULL);
+            lv_obj_set_style_margin_bottom(btn_demo_water, 10, 0);
+            lv_obj_t *lbl = lv_label_create(btn_demo_water);
+            if (lbl) {
+                lv_label_set_text(lbl, "Water Simulation");
+                lv_obj_center(lbl);
+            }
+        }
+        
+        // Pipes button
+        btn_demo_pipes = lv_button_create(menu_container);
+        if (btn_demo_pipes) {
+            lv_obj_set_size(btn_demo_pipes, 240, 35);
+            lv_obj_add_event_cb(btn_demo_pipes, demo_pipes_click_cb, LV_EVENT_ALL, NULL);
+            lv_obj_t *lbl = lv_label_create(btn_demo_pipes);
+            if (lbl) {
+                lv_label_set_text(lbl, "3D Pipes Screensaver");
+                lv_obj_center(lbl);
+            }
+        }
+    }
+
+    // Image Widget for Demos (initially hidden)
     img_water = lv_image_create(tab_demo);
     if (img_water) {
         lv_image_set_src(img_water, &water_img_dsc);
         lv_obj_set_size(img_water, 640, 280);
         lv_image_set_inner_align(img_water, LV_IMAGE_ALIGN_STRETCH);
         lv_obj_align(img_water, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_add_flag(img_water, LV_OBJ_FLAG_HIDDEN);
     }
 
     // ==========================================
@@ -1118,6 +1424,12 @@ void real_main(void) {
                     } else if (active_tab == 2) { // Editor
                         if (text_editor) lv_group_add_obj(g_group, text_editor);
                         if (text_editor) lv_group_focus_obj(text_editor);
+                    } else if (active_tab == 3) { // Demo
+                        if (current_demo_state == DEMO_MENU) {
+                            if (btn_demo_water) lv_group_add_obj(g_group, btn_demo_water);
+                            if (btn_demo_pipes) lv_group_add_obj(g_group, btn_demo_pipes);
+                            if (btn_demo_water) lv_group_focus_obj(btn_demo_water);
+                        }
                     }
                 }
             }
@@ -1154,9 +1466,13 @@ void real_main(void) {
                     } else {
                         // Other tabs -> Standard double click / single click detection
                         if (release_time - last_click_time < 350) {
-                            // Double click detected! Move focus to next widget
-                            lv_group_focus_next(lv_group_get_default());
-                            printf("[main] Double click! Focus moved to next widget.\r\n");
+                            if (active_tab_idx == 3 && current_demo_state != DEMO_MENU) {
+                                exit_demo_to_menu();
+                            } else {
+                                // Double click detected! Move focus to next widget
+                                lv_group_focus_next(lv_group_get_default());
+                                printf("[main] Double click! Focus moved to next widget.\r\n");
+                            }
                             waiting_for_double_click = false;
                         } else {
                             waiting_for_double_click = true;
@@ -1171,8 +1487,17 @@ void real_main(void) {
             uint32_t current_time = time_us_32() / 1000;
             if (current_time - last_click_time >= 350) {
                 if (active_tab_idx == 3) {
-                    // Demo tab: Single click triggers a big random splash!
-                    trigger_water_splash();
+                    if (current_demo_state == DEMO_WATER) {
+                        trigger_water_splash();
+                    } else if (current_demo_state == DEMO_PIPES) {
+                        init_pipes_game();
+                    } else {
+                        // Demo menu: send event to focused list item button
+                        lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
+                        if (focused) {
+                            lv_obj_send_event(focused, LV_EVENT_CLICKED, NULL);
+                        }
+                    }
                 } else {
                     // Single click detected! Send LV_EVENT_CLICKED directly to focused widget
                     lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
@@ -1194,7 +1519,11 @@ void real_main(void) {
             last_game_update = now_ms;
 
             if (active_tab_idx == 3) {
-                update_water_simulation();
+                if (current_demo_state == DEMO_WATER) {
+                    update_water_simulation();
+                } else if (current_demo_state == DEMO_PIPES) {
+                    update_pipes_simulation();
+                }
             }
 
             if (game_active) {
