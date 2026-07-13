@@ -225,6 +225,13 @@ void show_toast(const char *message) {
     }
 }
 
+// Fast, lock-free pseudo-random number generator (LCG)
+static uint32_t audio_rand_seed = 0x12345678;
+static inline uint32_t fast_rand(void) {
+    audio_rand_seed = audio_rand_seed * 1103515245 + 12345;
+    return audio_rand_seed;
+}
+
 static inline int16_t get_sine_sample(void) {
     uint32_t sfx_phase_inc = 0;
     
@@ -260,15 +267,34 @@ static inline int16_t get_sine_sample(void) {
         audio_phase += phase_increment;
         return s;
     } else if (current_audio_mode == AUDIO_NOISE) {
-        // White Noise: random sample
-        int16_t noise = (int16_t)((rand() % 1600) - 800);
+        // White Noise: random sample using upper 16 bits of fast LCG
+        int16_t raw = (int16_t)(fast_rand() >> 16);
+        int16_t noise = (int16_t)((int32_t)raw * 4000 / 32768);
         return noise;
     } else if (current_audio_mode == AUDIO_RAIN) {
-        // Rain Sound: low-pass filtered random noise
+        // Rain Sound: Smooth brown wash (LPF at ~76Hz with gain compensation) + decaying raindrop patters
         static float lp_history = 0.0f;
-        float raw_noise = (float)((rand() % 2400) - 1200);
-        lp_history = 0.96f * lp_history + 0.04f * raw_noise;
-        return (int16_t)lp_history;
+        static float patter_val = 0.0f;
+        
+        int16_t raw1 = (int16_t)(fast_rand() >> 16);
+        float raw_noise = (float)raw1 * (4000.0f / 32768.0f);
+        // Leaky integrator for deep, smooth brown noise
+        lp_history = 0.99f * lp_history + 0.15f * raw_noise;
+        
+        // Decay existing patter pop
+        patter_val *= 0.92f;
+        
+        // Trigger a new raindrop patter envelope (~150 times per second)
+        if ((fast_rand() % 1000) < 3) {
+            int16_t raw2 = (int16_t)(fast_rand() >> 16);
+            patter_val = (float)raw2 * (4000.0f / 32768.0f);
+        }
+        
+        float final_val = lp_history + patter_val;
+        if (final_val > 32767.0f) final_val = 32767.0f;
+        if (final_val < -32768.0f) final_val = -32768.0f;
+        
+        return (int16_t)final_val;
     }
 
     // AUDIO_SILENT
