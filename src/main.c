@@ -138,6 +138,25 @@ static lv_obj_t *btn_audio_cycle = NULL;
 static lv_obj_t *slider = NULL;
 static lv_obj_t *text_editor = NULL;
 
+// Water Simulation Parameters
+#define WATER_W 128
+#define WATER_H 72
+static int16_t water_buf1[WATER_W * WATER_H] = {0};
+static int16_t water_buf2[WATER_W * WATER_H] = {0};
+static int16_t *water_prev = water_buf1;
+static int16_t *water_next = water_buf2;
+static uint8_t water_pixel_buf[WATER_W * WATER_H * 2] = {0}; // RGB565 buffer
+static lv_obj_t *img_water = NULL;
+
+static const lv_image_dsc_t water_img_dsc = {
+    .header.cf = LV_COLOR_FORMAT_RGB565,
+    .header.magic = LV_IMAGE_HEADER_MAGIC,
+    .header.w = WATER_W,
+    .header.h = WATER_H,
+    .data_size = WATER_W * WATER_H * 2,
+    .data = water_pixel_buf,
+};
+
 // Toast notification variables
 static lv_obj_t *toast_label = NULL;
 static uint32_t toast_hide_time = 0;
@@ -231,6 +250,115 @@ static inline uint32_t fast_rand(void) {
     audio_rand_seed = audio_rand_seed * 1103515245 + 12345;
     return audio_rand_seed;
 }
+
+// Procedural mosaic pool tiles generator
+static inline uint16_t get_pool_color_rgb565(int x, int y) {
+    int px = x % 16;
+    int py = y % 16;
+    if (px < 1 || py < 1) {
+        // Grout line: very light cyan-white
+        return 0xDFFF; 
+    } else {
+        // Cyan-blue mosaic tile color gradient
+        int intensity = (px + py) & 0x0F;
+        uint8_t r = 0;
+        uint8_t g = (uint8_t)(90 + intensity * 7);
+        uint8_t b = (uint8_t)(170 + intensity * 5);
+        return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    }
+}
+
+// Inject water splash at random coordinates
+void trigger_water_splash(void) {
+    int cx = 5 + (fast_rand() % (WATER_W - 10));
+    int cy = 5 + (fast_rand() % (WATER_H - 10));
+    for (int dy = -3; dy <= 3; dy++) {
+        for (int dx = -3; dx <= 3; dx++) {
+            if (dx*dx + dy*dy <= 9) {
+                int px = cx + dx;
+                int py = cy + dy;
+                if (px >= 0 && px < WATER_W && py >= 0 && py < WATER_H) {
+                    water_prev[py * WATER_W + px] = 4000;
+                }
+            }
+        }
+    }
+    current_sfx = SFX_POINT; // Quick splash beep
+    sfx_frame = 0;
+    printf("[water] Splash triggered at (%d, %d)\r\n", cx, cy);
+}
+
+// Solve 2D wave equations, warp tiles with heightmap refraction, and blend caustics
+void update_water_simulation(void) {
+    if (!img_water) return;
+
+    // 1. Ripple Propagation
+    for (int y = 1; y < WATER_H - 1; y++) {
+        for (int x = 1; x < WATER_W - 1; x++) {
+            int idx = y * WATER_W + x;
+            int16_t val = (water_prev[idx - 1] +
+                           water_prev[idx + 1] +
+                           water_prev[idx - WATER_W] +
+                           water_prev[idx + WATER_W]) / 2 - water_next[idx];
+            val = val - (val >> 4); // Loss of energy (damping increased to 6.25%)
+            water_next[idx] = val;
+        }
+    }
+    // Swap buffers
+    int16_t *temp = water_prev;
+    water_prev = water_next;
+    water_next = temp;
+
+    // 2. Render refractions & caustics to pixel buffer
+    uint16_t *pixels = (uint16_t *)water_pixel_buf;
+    for (int y = 0; y < WATER_H; y++) {
+        for (int x = 0; x < WATER_W; x++) {
+            int idx = y * WATER_W + x;
+            int offset_x = 0;
+            int offset_y = 0;
+            
+            if (x > 0 && x < WATER_W - 1 && y > 0 && y < WATER_H - 1) {
+                offset_x = (water_prev[idx - 1] - water_prev[idx + 1]) >> 3;
+                offset_y = (water_prev[idx - WATER_W] - water_prev[idx + WATER_W]) >> 3;
+            }
+            
+            int tx = x + offset_x;
+            int ty = y + offset_y;
+            if (tx < 0) tx = 0; if (tx >= WATER_W) tx = WATER_W - 1;
+            if (ty < 0) ty = 0; if (ty >= WATER_H) ty = WATER_H - 1;
+            
+            uint16_t base_color = get_pool_color_rgb565(tx, ty);
+            
+            // Caustics shading from refraction slope magnitude
+            int shade = offset_x + offset_y;
+            
+            uint8_t r = (uint8_t)((base_color >> 11) & 0x1F) << 3;
+            uint8_t g = (uint8_t)((base_color >> 5) & 0x3F) << 2;
+            uint8_t b = (uint8_t)(base_color & 0x1F) << 3;
+            
+            int r_new = r + shade * 2;
+            int g_new = g + shade * 2;
+            int b_new = b + shade * 2;
+            
+            if (r_new > 255) r_new = 255; else if (r_new < 0) r_new = 0;
+            if (g_new > 255) g_new = 255; else if (g_new < 0) g_new = 0;
+            if (b_new > 255) b_new = 255; else if (b_new < 0) b_new = 0;
+            
+            pixels[idx] = (uint16_t)(((r_new & 0xF8) << 8) | ((g_new & 0xFC) << 3) | (b_new >> 3));
+        }
+    }
+    
+    // Auto raindrop ripples (once every 40 frames on average)
+    if ((fast_rand() % 1000) < 15) {
+        int rx = 2 + (fast_rand() % (WATER_W - 4));
+        int ry = 2 + (fast_rand() % (WATER_H - 4));
+        water_prev[ry * WATER_W + rx] = 1000 + (fast_rand() % 1000);
+    }
+
+    lv_obj_invalidate(img_water);
+}
+
+
 
 static inline int16_t get_sine_sample(void) {
     uint32_t sfx_phase_inc = 0;
@@ -451,10 +579,11 @@ void build_ui(void) {
     lv_obj_t *tab1 = lv_tabview_add_tab(tabview, "Dashboard");
     lv_obj_t *tab2 = lv_tabview_add_tab(tabview, "Controls");
     lv_obj_t *tab_editor = lv_tabview_add_tab(tabview, "Editor");
+    lv_obj_t *tab_demo = lv_tabview_add_tab(tabview, "Demo");
     lv_obj_t *tab3 = lv_tabview_add_tab(tabview, "System");
     tab4 = lv_tabview_add_tab(tabview, "Game");
 
-    if (tab1 == NULL || tab2 == NULL || tab_editor == NULL || tab3 == NULL || tab4 == NULL) {
+    if (tab1 == NULL || tab2 == NULL || tab_editor == NULL || tab_demo == NULL || tab3 == NULL || tab4 == NULL) {
         printf("[main] ERROR: Failed to create one of the tabs!\r\n");
         return;
     }
@@ -611,6 +740,20 @@ void build_ui(void) {
         lv_textarea_set_placeholder_text(text_editor, "Type in serial console to edit text...\nUse arrow keys & backspace!");
         lv_textarea_set_cursor_click_pos(text_editor, true);
         lv_obj_set_style_text_font(text_editor, &lv_font_montserrat_14, 0);
+    }
+
+    // ==========================================
+    // Tab: Demo (2D Water Ripple Simulation)
+    // ==========================================
+    lv_obj_remove_flag(tab_demo, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(tab_demo, 0, 0);
+
+    img_water = lv_image_create(tab_demo);
+    if (img_water) {
+        lv_image_set_src(img_water, &water_img_dsc);
+        lv_obj_set_size(img_water, 640, 280);
+        lv_image_set_inner_align(img_water, LV_IMAGE_ALIGN_STRETCH);
+        lv_obj_align(img_water, LV_ALIGN_CENTER, 0, 0);
     }
 
     // ==========================================
@@ -949,9 +1092,9 @@ void real_main(void) {
         if (btn_pressed && !button_processed) {
             uint32_t current_time = time_us_32() / 1000;
             if (current_time - press_start_time >= 800) {
-                // Long press detected! Switch tabs (cycles through all 5 tabs)
+                // Long press detected! Switch tabs (cycles through all 6 tabs)
                 static int active_tab = 0;
-                active_tab = (active_tab + 1) % 5; // Dashboard -> Controls -> Editor -> System -> Game
+                active_tab = (active_tab + 1) % 6; // Dashboard -> Controls -> Editor -> Demo -> System -> Game
                 if (tabview) {
                     lv_tabview_set_active(tabview, active_tab, LV_ANIM_ON);
                 }
@@ -985,7 +1128,7 @@ void real_main(void) {
             if (!button_processed) {
                 uint32_t duration = release_time - press_start_time;
                 if (duration < 800) {
-                    if (active_tab_idx == 4) {
+                    if (active_tab_idx == 5) {
                         // Game Tab active -> Single click flaps instantly, no double-click delay needed!
                         if (!game_active) {
                             // Start/restart game
@@ -1024,14 +1167,19 @@ void real_main(void) {
             }
         }
 
-        if (waiting_for_double_click && active_tab_idx != 4) {
+        if (waiting_for_double_click && active_tab_idx != 5) {
             uint32_t current_time = time_us_32() / 1000;
             if (current_time - last_click_time >= 350) {
-                // Single click detected! Send LV_EVENT_CLICKED directly to focused widget
-                lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
-                if (focused) {
-                    lv_obj_send_event(focused, LV_EVENT_CLICKED, NULL);
-                    printf("[main] Single click! Sent LV_EVENT_CLICKED to focused widget.\r\n");
+                if (active_tab_idx == 3) {
+                    // Demo tab: Single click triggers a big random splash!
+                    trigger_water_splash();
+                } else {
+                    // Single click detected! Send LV_EVENT_CLICKED directly to focused widget
+                    lv_obj_t *focused = lv_group_get_focused(lv_group_get_default());
+                    if (focused) {
+                        lv_obj_send_event(focused, LV_EVENT_CLICKED, NULL);
+                        printf("[main] Single click! Sent LV_EVENT_CLICKED to focused widget.\r\n");
+                    }
                 }
                 waiting_for_double_click = false;
             }
@@ -1039,11 +1187,15 @@ void real_main(void) {
 
         last_btn_state = btn_pressed;
 
-        // 50 Hz Flappy Bird Game Physics Tick
+        // 50 Hz Game Physics and Water Simulation Tick
         static uint32_t last_game_update = 0;
         uint32_t now_ms = time_us_32() / 1000;
         if (now_ms - last_game_update >= 20) {
             last_game_update = now_ms;
+
+            if (active_tab_idx == 3) {
+                update_water_simulation();
+            }
 
             if (game_active) {
                 // Apply gravity & velocity
@@ -1251,5 +1403,5 @@ void real_main(void) {
         sleep_ms(1);
     }
 
-    return 0;
+
 }
