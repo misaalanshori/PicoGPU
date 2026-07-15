@@ -3,125 +3,140 @@
 // =============================================================================
 // PicoGPU Feature Flags (spec §12.1)
 // =============================================================================
-// Enable/disable major GPU subsystems. Override before including this header
-// or via compiler -D flags.
+// Each flag declared here matches the exact name used in the implementation
+// (.c) files. Override via compiler -D flags or platformio.ini build_flags.
+// Undefined flags silently evaluate to 0 in #if; having explicit defaults
+// here makes that visible and intentional.
 
-// --- Feature: Double-buffering ---
-// Requires enough SRAM for two framebuffers.
-#ifndef FEATURE_DOUBLE_BUFFER
-  #define FEATURE_DOUBLE_BUFFER 0
+// --- Target hardware ---
+// RP2350-specific code paths (HSTX, hardware FPU, etc.)
+#ifndef FEATURE_TARGET_RP2350
+  #define FEATURE_TARGET_RP2350 0
 #endif
 
-// --- Feature: Display lists ---
-// Enables OP_BEGIN_DISPLAY_LIST / OP_END_DISPLAY_LIST / OP_EXEC_DISPLAY_LIST
-#ifndef FEATURE_DISPLAY_LIST
-  #define FEATURE_DISPLAY_LIST 1
+// --- Pixel formats ---
+#ifndef FEATURE_RGB565
+  #define FEATURE_RGB565 0
 #endif
 
-// --- Feature: VM (bytecode interpreter) ---
-// Enables OP_LOAD_PROCEDURE / OP_EXEC_PROCEDURE / OP_VM_RESET
-#ifndef FEATURE_VM
-  #define FEATURE_VM 1
-#endif
-
-// --- Feature: VM Parallel (Core 1 execution) ---
-// Requires FEATURE_VM. Enables VM_MODE_PARALLEL_CORE1.
-#ifndef FEATURE_VM_PARALLEL
-  #define FEATURE_VM_PARALLEL 0
-#endif
-
-// --- Feature: FPU-required primitives ---
+// --- FPU-required drawing primitives ---
 // Enables PRIM_TRIANGLE_GRADIENT, PRIM_BEZIER_QUAD, PRIM_BEZIER_CUBIC,
-// PRIM_GRADIENT_RECT. Requires hardware FPU (RP2350 has one).
+// PRIM_GRADIENT_RECT. Requires hardware FPU (RP2350 only).
 #ifndef FEATURE_FPU_PRIMITIVES
-  #define FEATURE_FPU_PRIMITIVES 1
+  #define FEATURE_FPU_PRIMITIVES 0
 #endif
 
-// --- Feature: Dithering ---
+// --- Arbitrary-angle sprite rotation (FPU path in blit.c) ---
+#ifndef FEATURE_ARBITRARY_ROTATION
+  #define FEATURE_ARBITRARY_ROTATION 0
+#endif
+
+// --- Dithering ---
 // Enables OP_SET_DITHER_MODE / DITHER_BAYER2 / DITHER_BAYER4
 #ifndef FEATURE_DITHERING
-  #define FEATURE_DITHERING 1
+  #define FEATURE_DITHERING 0
 #endif
 
-// --- Feature: Chroma key transparency ---
-// Enables OP_SET_CHROMA_KEY / OP_ENABLE_TRANSPARENCY
-#ifndef FEATURE_CHROMA_KEY
-  #define FEATURE_CHROMA_KEY 1
-#endif
-
-// --- Feature: Named VRAM allocations ---
-// Enables OP_VRAM_ALLOC_NAMED / OP_VRAM_LOOKUP / OP_VRAM_FREE_NAMED
-#ifndef FEATURE_VRAM_NAMED
-  #define FEATURE_VRAM_NAMED 1
-#endif
-
-// --- Feature: Frame statistics ---
-// Enables OP_ENABLE_FRAME_STATS / OP_GET_FRAME_STATS
-#ifndef FEATURE_FRAME_STATS
-  #define FEATURE_FRAME_STATS 1
-#endif
-
-// --- Feature: Text rendering ---
-// Enables OP_RENDER_TEXT / OP_GET_FONT_METADATA
-#ifndef FEATURE_TEXT_RENDER
-  #define FEATURE_TEXT_RENDER 1
-#endif
-
-// --- Feature: Tilemap rendering ---
-// Enables OP_DRAW_TILEMAP
-#ifndef FEATURE_TILEMAP
-  #define FEATURE_TILEMAP 1
-#endif
-
-// --- Feature: 9-patch sprite rendering ---
-// Enables OP_DRAW_9PATCH
-#ifndef FEATURE_9PATCH
-  #define FEATURE_9PATCH 1
-#endif
-
-// --- Feature: Flood fill ---
-// Enables PRIM_FLOOD_FILL. Requires scratch buffer from arena.
-#ifndef FEATURE_FLOOD_FILL
-  #define FEATURE_FLOOD_FILL 1
-#endif
-
-// --- Feature: Screen capture ---
+// --- Screen capture to VRAM ---
 // Enables OP_CAPTURE_REGION
 #ifndef FEATURE_CAPTURE_REGION
-  #define FEATURE_CAPTURE_REGION 1
+  #define FEATURE_CAPTURE_REGION 0
 #endif
 
-// --- Feature: Profiling ---
-// Enables OP_GET_PROFILE
-#ifndef FEATURE_PROFILING
-  #define FEATURE_PROFILING 0
+// --- Named VRAM allocations ---
+// Enables OP_VRAM_ALLOC_NAMED / OP_VRAM_LOOKUP / OP_VRAM_FREE_NAMED
+#ifndef FEATURE_NAMED_VRAM
+  #define FEATURE_NAMED_VRAM 0
 #endif
 
-// --- Feature: Scheduled procedures ---
-// Enables OP_SCHEDULE_PROCEDURE / OP_UNSCHEDULE_PROCEDURE. Requires FEATURE_VM.
-#ifndef FEATURE_SCHEDULED_PROCS
-  #define FEATURE_SCHEDULED_PROCS 1
+// --- Display lists ---
+// Enables OP_BEGIN_DISPLAY_LIST / OP_END_DISPLAY_LIST / OP_EXEC_DISPLAY_LIST
+#ifndef FEATURE_DISPLAY_LIST
+  #define FEATURE_DISPLAY_LIST 0
+#endif
+
+// --- Single-deferred draw queue ---
+// On BUFFERING_SINGLE_DEFERRED profiles, draw commands are queued in SRAM
+// and flushed at END_FRAME rather than executed during active scanout.
+#ifndef FEATURE_DEFERRED_DRAW
+  #define FEATURE_DEFERRED_DRAW 0
+#endif
+
+// --- BEGIN_FRAME / END_FRAME lifecycle ---
+// Enables OP_BEGIN_FRAME / OP_END_FRAME and the frame timer.
+#ifndef FEATURE_BEGIN_END_FRAME
+  #define FEATURE_BEGIN_END_FRAME 0
+#endif
+
+// --- Frame statistics ---
+// Enables OP_ENABLE_FRAME_STATS / OP_GET_FRAME_STATS
+#ifndef FEATURE_FRAME_STATS
+  #define FEATURE_FRAME_STATS 0
+#endif
+
+// --- Unsolicited event buffer ---
+// Enables GET_EVENTS / EVT_FRAME_COMPLETE etc.
+#ifndef FEATURE_EVENT_BUFFER
+  #define FEATURE_EVENT_BUFFER 0
+#endif
+
+// --- Vector font rendering (Phase 4+) ---
+#ifndef FEATURE_VECTOR_FONTS
+  #define FEATURE_VECTOR_FONTS 0
+#endif
+
+// --- Pawn VM (bytecode interpreter, Phase 4) ---
+// Enables OP_LOAD_PROCEDURE / OP_EXEC_PROCEDURE / OP_VM_RESET
+#ifndef FEATURE_PAWN_VM
+  #define FEATURE_PAWN_VM 0
+#endif
+
+// --- Pawn floating-point extension (Phase 4) ---
+#ifndef FEATURE_PAWN_FLOAT
+  #define FEATURE_PAWN_FLOAT 0
+#endif
+
+// --- VM Core 1 parallel execution (Phase 4) ---
+#ifndef FEATURE_VM_PARALLEL_CORE1
+  #define FEATURE_VM_PARALLEL_CORE1 0
+#endif
+
+// --- VM cooperative scheduling (Phase 4) ---
+#ifndef FEATURE_VM_COOPERATIVE
+  #define FEATURE_VM_COOPERATIVE 0
+#endif
+
+// --- ST7796 compatibility shim (Tier 3 display, Phase 5+) ---
+#ifndef FEATURE_ST7796_COMPAT
+  #define FEATURE_ST7796_COMPAT 0
 #endif
 
 // =============================================================================
-// Dependency #error checks (spec §12.1)
+// Dependency #error checks
 // =============================================================================
 
-#if FEATURE_VM_PARALLEL && !FEATURE_VM
-  #error "FEATURE_VM_PARALLEL requires FEATURE_VM"
+#if FEATURE_PAWN_FLOAT && !FEATURE_PAWN_VM
+  #error "FEATURE_PAWN_FLOAT requires FEATURE_PAWN_VM"
 #endif
 
-#if FEATURE_SCHEDULED_PROCS && !FEATURE_VM
-  #error "FEATURE_SCHEDULED_PROCS requires FEATURE_VM"
+#if FEATURE_VM_PARALLEL_CORE1 && !FEATURE_PAWN_VM
+  #error "FEATURE_VM_PARALLEL_CORE1 requires FEATURE_PAWN_VM"
 #endif
 
-#if FEATURE_CAPTURE_REGION && !FEATURE_VRAM_NAMED
-  #error "FEATURE_CAPTURE_REGION requires FEATURE_VRAM_NAMED"
+#if FEATURE_VM_COOPERATIVE && !FEATURE_PAWN_VM
+  #error "FEATURE_VM_COOPERATIVE requires FEATURE_PAWN_VM"
 #endif
 
-#if FEATURE_FRAME_STATS && !FEATURE_PROFILING
-  // FEATURE_FRAME_STATS is a lighter-weight subset; allowed without PROFILING.
-  // No error — frame stats uses its own lightweight counters.
+#if FEATURE_CAPTURE_REGION && !FEATURE_NAMED_VRAM
+  #error "FEATURE_CAPTURE_REGION requires FEATURE_NAMED_VRAM (VRAM heap must be initialised)"
+#endif
+
+#if FEATURE_FPU_PRIMITIVES && !FEATURE_TARGET_RP2350
+  #error "FEATURE_FPU_PRIMITIVES requires FEATURE_TARGET_RP2350 (hardware FPU)"
+#endif
+
+#if FEATURE_ARBITRARY_ROTATION && !FEATURE_FPU_PRIMITIVES
+  #error "FEATURE_ARBITRARY_ROTATION requires FEATURE_FPU_PRIMITIVES"
 #endif
 
 // =============================================================================

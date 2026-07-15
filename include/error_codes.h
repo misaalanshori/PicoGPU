@@ -35,3 +35,9 @@
 #define ERR_VM_UNAVAILABLE      ERR_UNSUPPORTED     // VM not supported in profile
 #define ERR_VRAM_FULL           ERR_OUT_OF_MEMORY   // VRAM region exhausted
 #define ERR_PAYLOAD_TOO_LARGE   ERR_BAD_LENGTH      // payload > 65535 bytes
+
+// Aliases for Phase 3 named-VRAM and display-list modules
+#define ERR_VRAM_NAME_NOT_FOUND ERR_VRAM_NOT_FOUND  // vram_named.c: hash not in table
+#define ERR_VRAM_NAME_TABLE_FULL ERR_OUT_OF_MEMORY  // vram_named.c: all 64 slots used
+#define ERR_DISPLAY_LIST_FULL   ERR_OUT_OF_MEMORY   // display_list.c: recording exceeded max_bytes
+#define ERR_OVERFLOW            ERR_OUT_OF_MEMORY   // dispatch.c: deferred queue full
