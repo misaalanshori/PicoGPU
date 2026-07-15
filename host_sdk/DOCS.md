@@ -31,11 +31,13 @@
 22. [Chroma Key Transparency](#22-chroma-key-transparency)
 23. [Scissor Stack — Clip Rectangles](#23-scissor-stack--clip-rectangles)
 24. [RLE Encoding for Pixel Data](#24-rle-encoding-for-pixel-data)
-25. [Capabilities Discovery](#25-capabilities-discovery)
-26. [Error Codes — Complete Reference](#26-error-codes--complete-reference)
-27. [Integration Patterns and Recipes](#27-integration-patterns-and-recipes)
-28. [Known Limitations and Caveats](#28-known-limitations-and-caveats)
-29. [Wire-Format Quick Reference](#29-wire-format-quick-reference)
+25. [Pixel Write Pipeline — Gate Order](#25-pixel-write-pipeline--gate-order)
+26. [VM Commands — Phase 4 Stub Reference](#26-vm-commands--phase-4-stub-reference)
+27. [Capabilities Discovery](#27-capabilities-discovery)
+28. [Error Codes — Complete Reference](#28-error-codes--complete-reference)
+29. [Integration Patterns and Recipes](#29-integration-patterns-and-recipes)
+30. [Known Limitations and Caveats](#30-known-limitations-and-caveats)
+31. [Wire-Format Quick Reference](#31-wire-format-quick-reference)
 
 ---
 
@@ -490,6 +492,8 @@ void gpu_enable_frame_stats(bool enable);
 
 Enables or disables per-frame stat accumulation. Default: **disabled**. When disabled, `GET_FRAME_STATS` returns all zeros. Enable at the start of your session if you need profiling data.
 
+> **Important:** Re-enabling frame stats (calling with `enable=true` when stats were previously disabled) **resets all counters** — `frame_count`, `last_render_ms`, `ring_peak_pct`, and `missed_frames` are zeroed. This is intentional so accumulated stale data doesn't pollute a fresh measurement session.
+
 ---
 
 ## 10. Drawing State — Global Modifiers
@@ -730,7 +734,7 @@ Scanline flood fill from seed point `(x,y)`. Fills all pixels that match the see
 
 ### 11.17 FPU Primitives — RP2350 Only
 
-The following require `FEATURE_FPU_PRIMITIVES` in the firmware. On unsupported builds they return `ERR_FEATURE_UNAVAILABLE`. Check `GET_CAPABILITIES` bit 2 (`GPU_CAP_FPU_PRIMITIVES`) before use.
+The following require `FEATURE_FPU_PRIMITIVES` in the firmware and the RP2350 hardware FPU. On unsupported builds (RP2040 or `FEATURE_FPU_PRIMITIVES=0`) they return `ERR_FEATURE_UNAVAILABLE`. Always check `GET_CAPABILITIES` bit 2 (`GPU_CAP_FPU_PRIMITIVES`) before use. See §27 for the capability-safe usage pattern.
 
 #### Quadratic Bézier Curve
 
@@ -794,7 +798,7 @@ void gpu_fill_screen(uint16_t color);
 
 Fills the **entire framebuffer** with `color`, **ignoring the active scissor rect**. The fastest way to clear the screen. Use this instead of drawing a fullscreen rectangle when you want absolute fill speed.
 
-**Payload:** `[color(2)]` — 2 bytes.
+> **Pipeline note:** `FILL_SCREEN` calls `effect_fill_hspan()` internally, which performs a scissor-clipped `memset`. Unlike `effect_write_pixel()`, it **bypasses dithering and blend mode** — the write is always a raw overwrite regardless of the active dither and blend settings. This makes it faster but means dither/blend are not applied to the fill color.
 
 ### 12.2 `BLIT_SPRITE` — Stream Pixel Data Directly
 
@@ -814,7 +818,11 @@ Streams raw pixel data from the host directly to the framebuffer. The GPU does n
 
 **Automatic chunking:** The SDK splits large sprites into multiple packets automatically, advancing `y` by the number of rows sent per packet. Each chunk is a full `BLIT_SPRITE` packet with its own CRC. Maximum pixel bytes per packet: `4096 - 7 = 4089` bytes.
 
-**Effective ceiling:** Because the wire format has no chunk/offset field, there is no way to send a sprite larger than one row per packet if that row exceeds 4089 bytes. For wide 16bpp sprites at high resolution, use `UPLOAD_VRAM` + `DRAW_VRAM_SPRITE` instead.
+**Hard size ceiling from firmware:** The firmware accumulates the entire `BLIT_SPRITE` payload into a 4 KB scratch buffer before dispatching (per the packet parser architecture). The parser rejects any payload exceeding `MAX_PAYLOAD_SIZE` (4096 bytes) with `ERR_PAYLOAD_TOO_LARGE`. With the 7-byte header, the effective pixel data ceiling is **4089 bytes**, which limits a single `BLIT_SPRITE` call to approximately:
+- 8bpp: ≈ 63×63 pixels per packet (but the SDK row-chunks so the total sprite can be any size)
+- 16bpp: ≈ 45×45 pixels per packet
+
+Because `BLIT_SPRITE` has **no byte_offset field** in its wire format, the SDK works around this by sending multiple packets with different `y` values (row-based chunking). This works for sprites of any height, but any single row of pixel data must still fit in one packet. For sprites wider than ≈4089 pixels at 8bpp (or ≈2044 pixels at 16bpp), use `UPLOAD_VRAM` + `DRAW_VRAM_SPRITE` instead.
 
 **The clip rect applies.** Pixels outside the current clip rect are silently discarded.
 
@@ -1524,37 +1532,155 @@ gpu_pop_clip_rect();
 
 `BLIT_SPRITE` and `UPLOAD_VRAM` support optional run-length encoding to reduce SPI transfer size for sprites with large uniform-color regions.
 
-### 24.1 Format
+### 24.1 Exact Wire Format (from firmware `blit.c`)
 
-Set `rle_flag = GPU_BLIT_RLE` in the blit or upload call. The encoded data consists of alternating:
+Set `rle_flag = GPU_BLIT_RLE` in the blit or upload call. The encoded stream is a sequence of tokens:
 
-- **Run segment:** `[0xFF][count][color_byte]` — repeat `color_byte` for `count` times (1–254).
-- **Literal segment:** `[0x00][n][byte0][byte1]...[byteN-1]` — copy `n` raw bytes verbatim (1–254).
+**Token type 1 — Literal sequence:** token byte is `0x00`
+```
+[0x00] [N:1B] [pixel_0] [pixel_1] ... [pixel_N-1]
+```
+Emits `N` pixels verbatim. `N` is 1–255.
 
-> The run marker is `0xFF` and the literal marker is `0x00`. Any other byte value is a literal byte for the old simple format — check your encoder matches the firmware's decoder in `vram.c`.
+**Token type 2 — Run:** token byte is any non-zero value
+```
+[COUNT:1B] [color:bpp_bytes]
+```
+Emits `COUNT` copies of `color`. `COUNT` is 1–255.
 
-Actually, the format used by the firmware decoder is:
-- If `count_byte == 0x00`: next byte `n`, then `n` literal bytes.
-- Otherwise: `count_byte` = repetition count, next byte = pixel value. Repeat that pixel `count_byte` times.
+- For **8bpp** profiles: each pixel/color is 1 byte.
+- For **16bpp** profiles: each pixel/color is 2 bytes, little-endian.
 
-This encodes runs of repeated pixels efficiently. For images with few repeated runs, raw (`GPU_BLIT_RAW`) may be smaller.
+**Example (8bpp):**
+```
+// 5 red pixels (0xE0), then 3 literal pixels:
+05 E0       → E0 E0 E0 E0 E0
+00 03 F0 07 20  → F0, 07, 20
+```
+
+**Important:** The decoder used by `BLIT_SPRITE` and `UPLOAD_VRAM` is identical (`rle_state_t` in `blit.c`). However, `UPLOAD_VRAM` passes the decoded pixels to VRAM storage, while `BLIT_SPRITE` passes them directly to `effect_write_pixel()` (the full pixel pipeline applies).
 
 ### 24.2 When to Use RLE
 
 RLE is beneficial for:
 - UI sprites with large solid-color areas (backgrounds, buttons, borders).
 - Tiles in a tile sheet where many tiles are uniform.
-- Any 8bpp sprite with a large transparent (chroma key) background.
+- Any sprite with large chroma-key (transparent) regions — encode as a single run.
 
 RLE is not beneficial for:
 - Photos or complex gradients with few repeated pixels.
 - Sprites smaller than ~64 bytes.
+- RLE overhead (2-byte header per token) can make encoded data *larger* than raw if there are few runs.
 
 ---
 
-## 25. Capabilities Discovery
+## 25. Pixel Write Pipeline — Gate Order
 
-Call `GET_CAPABILITIES` once at connection to auto-detect what the attached firmware supports. Do not hardcode assumptions about the firmware build.
+All pixel writes from primitives, blits, and text go through `effect_write_pixel()` in `effects.c`. The gates are evaluated **in this exact order**; failing any gate causes the pixel to be silently skipped:
+
+```
+1. Bounds check      — (x,y) must be within framebuffer dimensions
+2. Scissor test      — (x,y) must be inside the current clip rect
+3. Chroma key check  — if transparency enabled and pixel == chroma_key_color: skip
+4. Dithering         — bayer bias applied per-channel to the source color
+5. Blend mode        — source combined with destination (XOR/OR/AND/OVERWRITE)
+6. Framebuffer write — final value stored to g_fb_back
+```
+
+### 25.1 Fill Operations — Fast Path
+
+`FILL_SCREEN` and all **filled primitive** span-fills use `effect_fill_hspan()` instead of `effect_write_pixel()`. This fast path:
+- **Does apply:** bounds check, scissor clipping.
+- **Does NOT apply:** chroma key, dithering, blend mode. Span fills are always raw overwrites.
+
+**Implication:** `gpu_fill_screen()` and `gpu_rect_filled()` are unconditional overwrites regardless of the active chroma key, dither mode, or blend mode. Only per-pixel primitives (`SET_PIXEL`, outlines, etc.) and blit operations use the full gate pipeline.
+
+### 25.2 Dithering Implementation Details
+
+Bayer dithering applies a per-channel bias derived from the spatial position `(x mod 2, y mod 2)` for BAYER2 and `(x mod 4, y mod 4)` for BAYER4. The bias is added to each channel independently and clamped to the channel's maximum value. This prevents "color bleeding" between packed-byte channels.
+
+- **RGB332** (8bpp): 3-bit channels get a 0–7 bias; the 2-bit blue channel gets a 0/1 bias at the 50% Bayer threshold.
+- **RGB565** (16bpp): 5-bit R/B channels get a 0/1 bias (threshold at 1/16); 6-bit G gets a 0/1/2/3 bias.
+
+---
+
+## 26. VM Commands — Phase 4 Stub Reference
+
+The Pawn VM (`FEATURE_PAWN_VM`) is defined in the firmware architecture but **not yet implemented in Phase 0–3**. All VM opcodes (`0x90`–`0x94` and `0x17`) currently return `ERR_FEATURE_UNAVAILABLE` and perform no action.
+
+Do **not** use these commands in production firmware v1.x. They are documented here for completeness and future integration planning.
+
+### 26.1 SET_VM_MODE (0x17)
+
+```c
+// Not yet available — returns ERR_FEATURE_UNAVAILABLE
+// Payload: [mode(1B)]
+```
+
+| Mode constant | Value | Description |
+|---|---|---|
+| `VM_MODE_BLOCKING_CORE0` | `0x00` | Execute VM procedure on Core 0, blocking the render loop |
+| `VM_MODE_COOPERATIVE_CORE0` | `0x01` | Execute VM in quantized slices; yield back to render loop every 1000 instructions |
+| `VM_MODE_PARALLEL_CORE1` | `0x02` | Execute VM on Core 1 in parallel with rendering (RP2350 only) |
+
+### 26.2 LOAD_PROCEDURE (0x90)
+
+```
+Payload: [proc_bytecode: N bytes]
+Response: none
+```
+
+Loads a Pawn VM bytecode image into the VM heap (reserved via `RESERVE_VM=YES` in `SYSTEM_CONFIG`). The bytecode is verified for format correctness but not pre-validated for runtime safety.
+
+### 26.3 EXEC_PROCEDURE (0x91)
+
+```
+Payload: [entry_point_offset(4B LE)]
+Response: none (completion reported via GPU_EVT_VM_PROC_DONE event)
+```
+
+Begins executing the loaded procedure starting at the specified bytecode offset.
+
+### 26.4 VM_RESET (0x92)
+
+```
+Payload: none
+Response: none
+```
+
+Halts any running VM execution and resets the VM heap to empty.
+
+### 26.5 SCHEDULE_PROCEDURE (0x93)
+
+```
+Payload: [entry_point(4B)][trigger_type(1B)]
+```
+
+Schedules the loaded procedure to run automatically on a trigger event:
+
+| Trigger constant | Value | When |
+|---|---|---|
+| `TRIGGER_VBLANK` | `0x00` | Every VBLANK interrupt |
+| `TRIGGER_BEGIN_FRAME` | `0x01` | When BEGIN_FRAME is received |
+| `TRIGGER_END_FRAME` | `0x02` | When END_FRAME is received |
+
+### 26.6 UNSCHEDULE_PROCEDURE (0x94)
+
+```
+Payload: [trigger_type(1B)]
+```
+
+Removes the scheduled procedure for the given trigger.
+
+### 26.7 GET_VM_STATE (0xE4) — Current Behavior
+
+In Phase 0–3 firmware, `GET_VM_STATE` always returns `[0x00, 0x00]` — VM unavailable. Once Phase 4 is implemented, `r[0]` will reflect the actual VM state (0=unavailable, 1=idle, 2=loaded/running) and `r[1]` the heap utilization percentage.
+
+---
+
+## 27. Capabilities Discovery
+
+Call `GET_CAPABILITIES` once at connection to auto-detect what the attached firmware supports. Do not hardcode assumptions about the firmware build. This is especially important for FPU primitives, RGB565 profiles, and display lists — all of which are compile-time feature flags.
 
 ```c
 uint32_t caps = gpu_get_capabilities();
@@ -1571,7 +1697,7 @@ if (caps & GPU_CAP_EVENT_BUFFER)    { /* GET_EVENTS available */ }
 if (caps & GPU_CAP_FRAME_STATS)     { /* GET_FRAME_STATS available after ENABLE_FRAME_STATS */ }
 ```
 
-### 25.1 Full Capabilities Bitmask
+### 27.1 Full Capabilities Bitmask
 
 | Bit | Constant | Feature |
 |---|---|---|
@@ -1594,9 +1720,11 @@ if (caps & GPU_CAP_FRAME_STATS)     { /* GET_FRAME_STATS available after ENABLE_
 
 ---
 
-## 26. Error Codes — Complete Reference
+## 28. Error Codes — Complete Reference
 
-The error code from the most recently completed command is readable via `gpu_get_status()`. Commands that fail do not produce side effects (the framebuffer is not partially modified). Errors are also posted to the event buffer.
+The error code from the most recently completed command is readable via `gpu_get_status()`. The firmware stores the error code after *every* command execution, including successful ones (`ERR_OK`). Errors are also posted to the event buffer.
+
+> **Note on spec divergence:** The error code values in this table reflect the **actual firmware and SDK implementation**. The original architectural specification (spec §5.4) had different numeric assignments. The firmware and host SDK are the canonical authority — do not use the raw spec §5.4 table if it differs.
 
 | Code | Constant | Meaning |
 |---|---|---|
@@ -1619,7 +1747,7 @@ The error code from the most recently completed command is readable via `gpu_get
 | `0x10` | `GPU_ERR_FRAME_NOT_OPEN` | Command requires an open frame (BEGIN_FRAME not called) |
 | `0xFF` | `GPU_ERR_INTERNAL` | Unclassified internal firmware error |
 
-### 26.1 Error-Checking Pattern
+### 28.1 Error-Checking Pattern
 
 Most commands are fire-and-forget. Check errors only when needed:
 
@@ -1635,7 +1763,7 @@ if (offset == GPU_VRAM_OFFSET_INVALID) {
 }
 ```
 
-### 26.2 CRC Mismatch Behavior
+### 28.2 CRC Mismatch Behavior
 
 On CRC failure:
 - **Buffered commands** (draw primitives, VRAM management, etc.): Command is rejected entirely. No side effects. `ERR_CRC_MISMATCH` is set.
@@ -1643,9 +1771,9 @@ On CRC failure:
 
 ---
 
-## 27. Integration Patterns and Recipes
+## 29. Integration Patterns and Recipes
 
-### 27.1 Standard Double-Buffer Game Loop
+### 29.1 Standard Double-Buffer Game Loop
 
 ```c
 // Initialization (once):
@@ -1681,7 +1809,7 @@ while (1) {
 }
 ```
 
-### 27.2 Single-Buffer with TE Synchronization
+### 29.2 Single-Buffer with TE Synchronization
 
 ```c
 gpu_system_config(GPU_PROFILE_640x480_SINGLE, GPU_RESERVE_VM_NO);
@@ -1700,7 +1828,7 @@ void te_irq_handler(void) {
 }
 ```
 
-### 27.3 VRAM Asset Management at Session Start
+### 29.3 VRAM Asset Management at Session Start
 
 ```c
 void load_assets(void) {
@@ -1723,7 +1851,7 @@ void load_assets(void) {
 }
 ```
 
-### 27.4 Display List for a Static HUD
+### 29.4 Display List for a Static HUD
 
 ```c
 void build_hud_display_list(uint32_t vram_offset) {
@@ -1752,7 +1880,7 @@ void draw_frame(void) {
 }
 ```
 
-### 27.5 Tiled Scrolling Map
+### 29.5 Tiled Scrolling Map
 
 ```c
 // Upload tile sheet (8 tiles of 16×16 at 8bpp = 8 × 256 = 2048 bytes):
@@ -1770,7 +1898,7 @@ gpu_draw_tilemap(tiles_offset, map_offset,
                  scroll_x, scroll_y);  // pixel scroll offset
 ```
 
-### 27.6 Capability-Safe FPU Usage
+### 29.6 Capability-Safe FPU Usage
 
 ```c
 uint32_t caps = gpu_get_capabilities();
@@ -1785,7 +1913,7 @@ void draw_smooth_curve(int x0, int y0, int cx, int cy, int x1, int y1) {
 }
 ```
 
-### 27.7 Safe Profile Switch
+### 29.7 Safe Profile Switch
 
 ```c
 void switch_to_profile(uint8_t new_profile_id) {
@@ -1806,7 +1934,7 @@ void switch_to_profile(uint8_t new_profile_id) {
 }
 ```
 
-### 27.8 Reconnect Recovery
+### 29.8 Reconnect Recovery
 
 If the host loses power or resets while the GPU keeps running (no profile switch occurred):
 
@@ -1836,13 +1964,13 @@ void on_host_reconnect(void) {
 
 ---
 
-## 28. Known Limitations and Caveats
+## 30. Known Limitations and Caveats
 
-### 28.1 No D/C Hardware Resync (C4)
+### 30.1 No D/C Hardware Resync (C4)
 
 The D/C pin is wired but not yet used for hardware packet resync. The firmware uses the `0xAA` sync byte scan + CRC-16 rejection as its primary corruption recovery mechanism. This provides reasonable robustness but is not as strong as D/C-based resync. If you experience persistent corruption after a glitch, send a `SOFT_RESET` and reinitialize.
 
-### 28.2 SPI CS Not PIO-Gated (C5)
+### 30.2 SPI CS Not PIO-Gated (C5)
 
 The PIO SPI receiver does not gate on CS; it runs the clock-edge sampling loop unconditionally. This means:
 - Dummy clocks generated by the host during MISO reads may inject spurious bytes into the MOSI stream. The `0xAA` sync scan + CRC catches most of these.
@@ -1850,23 +1978,19 @@ The PIO SPI receiver does not gate on CS; it runs the clock-edge sampling loop u
 
 **Mitigation:** Always deassert CS only at 8-bit boundaries (which the SDK does automatically). Keep CS HIGH for at least 100 ns between transactions.
 
-### 28.3 BLIT_SPRITE Payload Size Ceiling (~4089 bytes)
+### 30.3 BLIT_SPRITE Payload Size Ceiling (4089 bytes hard limit)
 
-`BLIT_SPRITE` has no offset/chunk field in its wire format. The SDK works around this by splitting large sprites into row-based chunks, but if a single row of pixel data exceeds ~4089 bytes (i.e. the sprite is wider than ~4089÷bytes_per_pixel pixels), the SDK cannot chunk that row and will silently truncate.
+`BLIT_SPRITE` has no byte_offset field. The firmware accumulates the full payload into a 4 KB scratch buffer. Packets exceeding `MAX_PAYLOAD_SIZE` (4096 bytes) are rejected with `ERR_PAYLOAD_TOO_LARGE` in the parser — this is a hard limit. The effective pixel ceiling per packet (4089 bytes after the 7-byte header) constrains single-packet sprites to approximately **63×63 px at 8bpp** or **45×45 px at 16bpp**.
 
-**Practical limits:**
-- 8bpp: maximum sprite width ≈ 4089 pixels (virtually unlimited for normal use).
-- 16bpp: maximum sprite width ≈ 2044 pixels.
+The SDK row-chunks to work around this for tall sprites, but this cannot help when a single row exceeds 4089 bytes. For sprites wider than these limits, always use `UPLOAD_VRAM` + `DRAW_VRAM_SPRITE`.
 
-For sprites that exceed these widths, use `UPLOAD_VRAM` (which has an explicit offset field and can be chunked arbitrarily) followed by `DRAW_VRAM_SPRITE`.
-
-### 28.4 VRAM Named Slot: No Memory Reclaim on Free
+### 30.4 VRAM Named Slot: No Memory Reclaim on Free
 
 `gpu_vram_free_named()` marks the 64-entry slot as available, but the underlying VRAM bytes are **not reclaimed**. The bump pointer (`g_vram_used`) is never decremented. Repeated alloc/free cycles will exhaust VRAM monotonically until the next profile switch.
 
 **Implication:** Named VRAM is designed for session-level asset management (allocate at startup, use throughout, clear on profile switch). It is not suitable for dynamic per-frame allocation cycles.
 
-### 28.5 Named VRAM and Raw UPLOAD_VRAM Cannot Safely Mix
+### 30.5 Named VRAM and Raw UPLOAD_VRAM Cannot Safely Mix
 
 Both `gpu_vram_alloc_named()` and `gpu_upload_vram()` share the same bump pointer (`g_vram_used`). Mixing both allocation strategies risks offset overlap:
 - If you call `gpu_upload_vram()` at a raw offset below `g_vram_used`, it overwrites already-named data.
@@ -1874,39 +1998,51 @@ Both `gpu_vram_alloc_named()` and `gpu_upload_vram()` share the same bump pointe
 
 **Rule:** Use either raw offsets or named slots for a given VRAM region, not both interchangeably.
 
-### 28.6 VRAM Is Zeroed on Every Profile Switch and RESET
+### 30.6 VRAM Is Zeroed on Every Profile Switch and RESET
 
 There is no partial preservation. All VRAM data, all named slots, all display list registrations — gone. Design your startup code to rebuild from scratch after any `SYSTEM_CONFIG` or RESET.
 
-### 28.7 Flood Fill Performance
+### 30.7 Flood Fill Performance
 
 `gpu_flood_fill()` is a recursive scanline flood fill. For large regions, it processes the entire fill area before dequeuing the next SPI command. During a large flood fill, the ring buffer may fill if the host continues sending commands; BUSY will assert.
 
 **Mitigation:** Send flood fills during low-traffic moments (e.g. at the start of a frame before other draws). For large static fills, use `gpu_fill_screen()` or `gpu_rect_filled()` instead.
 
-### 28.8 BLIT_SPRITE During Recording Ignored
+### 30.8 BLIT_SPRITE During Recording Ignored
 
 Streaming commands (`BLIT_SPRITE`, `UPLOAD_VRAM`) cannot be recorded into display lists. They return `ERR_FEATURE_UNAVAILABLE` if called between `BEGIN_DISPLAY_LIST` and `END_DISPLAY_LIST`. The recording session continues; only that command is skipped.
 
-### 28.9 Display List Nesting Depth = 4
+### 30.9 Display List Nesting Depth = 4
 
 `EXEC_DISPLAY_LIST` inside a display list is supported, but only to depth 4. Deeper nesting returns `ERR_INVALID_PARAM`. For typical HUD composition (top-level exec → panel layer → icon layer → text layer), depth 4 is sufficient.
 
-### 28.10 50 µs Query Guard Is a Conservative Placeholder
+### 30.10 50 µs Query Guard Is a Conservative Placeholder
 
 The 50 µs delay between sending a query and reading the MISO response is a placeholder. Under maximum ring buffer load with complex commands, Core 0 scheduling latency may exceed this. If you observe stale zero-responses from queries, increase the guard time in `gpu_query()` or call `gpu_wait_not_busy()` with a timeout before the response read.
 
-### 28.11 VREG Overclock (CPU_SPEED_FAST)
+### 30.11 VREG Overclock (CPU_SPEED_FAST)
 
 The firmware supports an optional 432 MHz / 1.40 V overclock via `CPU_SPEED_FAST=1` in the platformio.ini. This is outside Raspberry Pi's documented operating envelope and requires `vreg_disable_voltage_limit()`. The standard spec-compliant configuration is 384 MHz / 1.30 V. If you see instability, disable the overclock.
 
-### 28.12 Hardware RESET Only Stops Main Loop
+### 30.12 Hardware RESET Only Stops Main Loop
 
 The hardware RESET handler (`GPIO_IRQ_EDGE_FALL` on GP7) sets a flag that is polled by the main loop. If Core 0 is stuck in an infinite loop inside a command handler (e.g. a pathological flood fill), the RESET flag will not be processed until the handler returns. The watchdog timer is not yet implemented. For stuck scenarios, power-cycle the GPU.
 
+### 30.13 Filled Primitives Bypass Dither and Blend
+
+As detailed in §25.1, `FILL_SCREEN` and all span-filled primitives (`RECT_FILLED`, `CIRCLE_FILLED`, `ELLIPSE_FILLED`, `TRIANGLE_FILLED`, `POLYGON_FILLED`, `RECT_ROUNDED_FILLED`) use `effect_fill_hspan()` internally. This path **does not apply dithering or blend mode**. If you need dithering on a filled region, use `effect_write_pixel()`-based commands (outlines, or `GRADIENT_RECT`) instead.
+
+### 30.14 Deferred Queue Fixed at 8 KB
+
+The deferred draw queue (single-deferred profiles) is a flat 8 KB SRAM ring allocated from the arena. The deferred command format is `[opcode(1B)][len_lo(1B)][len_hi(1B)][payload(len B)]`. If the queue is full when a draw command arrives, `ERR_OVERFLOW` is returned and the command is dropped. For deferred profiles, budget your per-frame commands to stay within 8 KB total payload.
+
+### 30.15 SWAP_BUFFERS Is Deferred to VBLANK
+
+`SWAP_BUFFERS` sets `g_state.swap_pending = true` and returns immediately. The actual pointer swap happens inside the VBLANK scanline callback (`line == 0`). There is a 1-frame window where `swap_pending` is true but the swap has not yet occurred. `SWAP_BUFFERS_IMMEDIATE` calls `display_rp2350_swap_buffers()` synchronously and can tear.
+
 ---
 
-## 29. Wire-Format Quick Reference
+## 31. Wire-Format Quick Reference
 
 All multi-byte integers are little-endian. All coordinates are signed 16-bit. Opcode `0x30` (DRAW_PRIMITIVE) wraps all primitives — its first payload byte is the sub-opcode.
 
@@ -1972,7 +2108,7 @@ All multi-byte integers are little-endian. All coordinates are signed 16-bit. Op
 | `0x81` | VRAM_ALLOC_NAMED | 8 | `[hash(4)][byte_count(4)]` → response: `[offset(4)]` |
 | `0x82` | VRAM_LOOKUP | 4 | `[hash(4)]` → response: `[offset(4)]` |
 | `0x83` | VRAM_FREE_NAMED | 4 | `[hash(4)]` |
-| `0x84` | BEGIN_DISPLAY_LIST | 9 | `[slot_id(1)][vram_offset(4)][max_bytes(4)]` |
+| `0x84` | BEGIN_DISPLAY_LIST | 9 | `[slot_id(1)][vram_offset(4)][max_bytes(4)]` (all LE) |
 | `0x85` | END_DISPLAY_LIST | 0 | *(empty)* |
 | `0x86` | EXEC_DISPLAY_LIST | 1 | `[slot_id(1)]` |
 
