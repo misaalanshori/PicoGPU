@@ -68,11 +68,20 @@ static void hw_init_all(void) {
 
     // ── Step 1: Voltage ─────────────────────────────────────────────────────
 #if CPU_SPEED_FAST
-    // 432 MHz @ 1.40 V (user-verified stable setting)
+    // 432 MHz @ 1.40 V — user-validated overclock.
+    // NOTE: vreg_disable_voltage_limit() bypasses the SDK guardrail that
+    // exists because Raspberry Pi has not characterised/warranted RP2350
+    // silicon above 1.30 V. Stability is device-specific; validate under
+    // sustained load on YOUR silicon before using in production.
+    //
+    // SPEC NOTE (C9): The specification document (§2.1) states 384 MHz @
+    // 1.30 V as the maximum, and says the SDK limiter should not need to
+    // be disabled. This firmware build diverges from the spec intentionally.
+    // If spec compliance is required, set CPU_SPEED_FAST=0 instead.
     vreg_disable_voltage_limit();
     vreg_set_voltage(VREG_VOLTAGE_1_40);
 #else
-    // 384 MHz @ 1.30 V (conservative)
+    // 384 MHz @ 1.30 V (spec §2.1 maximum — within documented safe envelope)
     vreg_set_voltage(VREG_VOLTAGE_1_30);
 #endif
     sleep_ms(20);  // allow VREG to settle
@@ -174,6 +183,12 @@ int main(void) {
     // ── Core 0: Main GPU processing loop ────────────────────────────────────
     while (1) {
         // Handle RESET pin assertion from host
+        // M4 NOTE: Hardware RESET is routed through the software dispatch path
+        // (OP_SOFT_RESET) rather than having a fully independent reset path.
+        // This is an acceptable approximation as long as the main loop is not
+        // the thing that has hung. A truly stuck Core 0 (e.g. infinite loop in
+        // a handler) would not benefit from this RESET path. The watchdog timer
+        // (not yet implemented) would be the correct backstop for that case.
         if (g_reset_requested) {
             g_reset_requested = false;
             dispatch_command(OP_SOFT_RESET, NULL, 0);

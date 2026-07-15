@@ -4,6 +4,7 @@
 #include "vram.h"
 #include "../state/coprocessor_state.h"
 #include "../protocol/dispatch.h"
+#include "../protocol/packets.h"   // crc16_compute
 #include "error_codes.h"
 #include "opcodes.h"
 #include <string.h>
@@ -59,8 +60,8 @@ void handle_begin_display_list(const uint8_t *payload, uint16_t len) {
     uint32_t max_bytes   = (uint32_t)payload[5]|((uint32_t)payload[6]<<8)|((uint32_t)payload[7]<<16)|((uint32_t)payload[8]<<24);
 
     if (slot_id >= DL_MAX_SLOTS) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
-    // Validate VRAM region: header (8B) + max_bytes must fit
-    if (g_vram == NULL || vram_offset + 8u + max_bytes > g_vram_size) {
+    // Validate VRAM region: header (8B) + max_bytes + 2 CRC suffix bytes must fit
+    if (g_vram == NULL || vram_offset + 8u + max_bytes + 2u > g_vram_size) {
         coprocessor_set_error(ERR_INVALID_PARAM); return;
     }
 
@@ -80,14 +81,28 @@ void handle_begin_display_list(const uint8_t *payload, uint16_t len) {
 void handle_end_display_list(void) {
     if (!s_recording) { coprocessor_set_error(ERR_INVALID_PARAM); return; }
 
+    // M5 fix: guard against byte_count truncation
+    if (s_cursor > 0xFFFFu) {
+        s_recording = false;
+        coprocessor_set_error(ERR_OUT_OF_MEMORY);
+        return;
+    }
+
+    // H5 fix: compute CRC16 of the recorded command body
+    uint32_t base     = s_vram_base[s_active_slot];
+    uint16_t body_crc = crc16_compute(g_vram + base + 8u, s_cursor);
+
     // Write 8-byte header at vram_base[slot]
-    uint32_t base = s_vram_base[s_active_slot];
     dl_header_t hdr;
-    hdr.magic      = DL_MAGIC;
-    hdr.slot_id    = s_active_slot;
-    hdr._pad       = 0;
-    hdr.byte_count = (uint16_t)(s_cursor & 0xFFFF);
+    hdr.magic        = DL_MAGIC;
+    hdr.slot_id      = s_active_slot;
+    hdr.checksum_lo  = (uint8_t)(body_crc & 0xFFu);  // store low byte in header
+    hdr.byte_count   = (uint16_t)(s_cursor & 0xFFFFu);
     memcpy(g_vram + base, &hdr, sizeof(dl_header_t));
+    // Store high byte of CRC immediately after the header + commands
+    // as a 2-byte suffix: CRC_LO already in header[5]; CRC_HI in VRAM[base+8+byte_count]
+    g_vram[base + 8u + s_cursor]     = (uint8_t)(body_crc & 0xFFu);
+    g_vram[base + 8u + s_cursor + 1u] = (uint8_t)(body_crc >> 8u);
 
     s_recording = false;
     coprocessor_set_error(ERR_OK);
@@ -151,6 +166,15 @@ void handle_exec_display_list(const uint8_t *payload, uint16_t len) {
     memcpy(&hdr, g_vram + base, sizeof(dl_header_t));
     if (hdr.magic != DL_MAGIC || hdr.slot_id != slot_id) {
         coprocessor_set_error(ERR_INVALID_PARAM); return;
+    }
+
+    // H5 fix: verify CRC of recorded command body before replay
+    uint16_t stored_crc = (uint16_t)g_vram[base + 8u + hdr.byte_count]
+                        | ((uint16_t)g_vram[base + 8u + hdr.byte_count + 1u] << 8u);
+    uint16_t actual_crc = crc16_compute(g_vram + base + 8u, hdr.byte_count);
+    if (stored_crc != actual_crc) {
+        coprocessor_set_error(ERR_INVALID_PARAM);
+        return;
     }
 
     s_exec_depth++;

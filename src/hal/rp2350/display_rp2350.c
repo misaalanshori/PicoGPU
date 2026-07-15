@@ -115,6 +115,15 @@ void display_rp2350_init(void) {
     gpio_init(PIN_TE);
     gpio_set_dir(PIN_TE, GPIO_OUT);
     gpio_put(PIN_TE, 0);
+
+    // Initialize pico_hdmi video subsystem here, before Core 1 launch,
+    // with a placeholder geometry. apply_profile() will set the real mode.
+    // (C7 fix: previously this was gated by !s_core1_started inside
+    //  apply_profile(), but s_core1_started is always true by the time
+    //  handle_system_config fires — so that branch was dead.)
+    video_output_init(640, 480);
+    video_output_set_scanline_callback(scanline_cb);
+    video_output_set_vsync_callback(vsync_cb);
 }
 
 // =============================================================================
@@ -128,44 +137,33 @@ void display_rp2350_init(void) {
 //   6. Restart DVI
 // =============================================================================
 void display_rp2350_apply_profile(const profile_t *prof) {
-    // 1. Stop video output (signals Core 1 to spin-idle)
-    if (s_core1_started) {
-        video_output_stop();
-    }
-
-    // 2. Retune pll_usb for this profile's HSTX clock
-    //    (REFDIV=1, VCO=pll_vco_hz, POSTDIV1=pd1, POSTDIV2=pd2)
+    // 1. Retune pll_usb for this profile's HSTX clock
     pll_init(pll_usb, 1, prof->pll_vco_hz, prof->pll_postdiv1, prof->pll_postdiv2);
 
-    // 3. Point clk_hstx at pll_usb output
-    //    video_output_reconfigure_clock() reads clock_get_hz(clk_usb) to discover
-    //    the pll_usb output. clk_usb is still on pll_sys/9 from hw_init_all(),
-    //    so we configure clk_hstx directly here first, then let the library confirm.
+    // 2. Point clk_hstx at pll_usb output
     clock_configure(clk_hstx,
         0,
         CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,
         prof->clk_hstx_hz,
         prof->clk_hstx_hz);
 
-    // 4. Request video mode switch (applies on Core 1 main loop)
+    // 3. Request video mode switch on Core 1
     const video_mode_t *vmode = (prof->timing_id == TIMING_640x480_60)
                                 ? &video_mode_480_p
                                 : &video_mode_720_p;
 
-    if (!s_core1_started) {
-        // First time: full init (Core 1 not running yet; called before multicore_launch)
-        video_output_init(prof->logical_w, prof->logical_h);
-        video_output_set_scanline_callback(scanline_cb);
-        video_output_set_vsync_callback(vsync_cb);
-    } else {
-        // Profile switch: ask Core 1 to apply the new mode
+    if (s_core1_started) {
+        // Core 1 running: set mode and wait for confirmation
         g_mode_switch_complete = false;
         video_output_set_mode(vmode);
-        // Spin until Core 1 confirms the mode is applied
         while (!g_mode_switch_complete) { tight_loop_contents(); }
+    } else {
+        // Core 1 not yet launched — set mode directly (no spin-wait needed;
+        // Core 1 will pick it up when it starts).
+        video_output_set_mode(vmode);
     }
 
-    // 5. Set HSTX pixel format expand registers (hardware does all colour conversion)
+    // 4. Set HSTX pixel format expand registers
     uint32_t expand_tmds, expand_shift;
     if (prof->bpp_class == 16) {
         expand_tmds  = HSTX_EXPAND_TMDS_RGB565;
@@ -176,17 +174,16 @@ void display_rp2350_apply_profile(const profile_t *prof) {
     }
     video_output_set_pixel_format(expand_tmds, expand_shift);
 
-    // 6. Cache scale factors for the scanline callback
+    // 5. Cache scale factors for the scanline callback
     s_scale_x      = prof->scale_x;
     _disp_scale_y  = prof->scale_y;
     s_bytes_per_px = (prof->bpp_class == 16) ? 2u : 1u;
     s_output_width = (prof->timing_id == TIMING_640x480_60) ? 640u : 1280u;
 
-    // 7. Restart DVI output
+    // 6. Restart DVI output (profiles.c already called stop() before calling us)
     if (s_core1_started) {
         video_output_start();
     }
-    // (If not yet started, Core 1 launch itself will begin output)
 }
 
 // =============================================================================

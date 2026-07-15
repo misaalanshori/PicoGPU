@@ -508,6 +508,19 @@ void dispatch_command(uint8_t opcode, const uint8_t *payload, uint16_t len) {
     switch (opcode) {
         case OP_DRAW_PRIMITIVE:     handle_draw_primitive(payload, len);         return;
         case OP_FILL_SCREEN:        handle_fill_screen(payload, len);            return;
+        // H3 NOTE — BLIT_SPRITE streaming limitation:
+        // The spec (§5.7) envisions BLIT_SPRITE as a "streamed" command whose
+        // pixel data drains directly from the ring buffer, allowing sprites up
+        // to 255×255 pixels (65,025 bytes at 1bpp). This implementation instead
+        // accumulates the ENTIRE payload into a 4 KB scratch buffer before
+        // dispatching (packets.c). Payloads exceeding MAX_PAYLOAD_SIZE (4096 B)
+        // are rejected with ERR_PAYLOAD_TOO_LARGE in the parser — so the
+        // practical ceiling is ~4089 bytes of pixel data (6-byte header leaves
+        // ~4089 B), approximately 63×63 px at 1bpp or ~45×45 px at 2bpp.
+        // Unlike UPLOAD_VRAM / LOAD_PROCEDURE, BLIT_SPRITE has no byte_offset
+        // field in its wire format, so there is no chunking workaround.
+        // To support large BLIT_SPRITEs without PIO streaming: upload the
+        // sprite data via UPLOAD_VRAM (chunked), then use DRAW_VRAM_SPRITE.
         case OP_BLIT_SPRITE:        handle_blit_sprite(payload, len);            return;
         case OP_DRAW_VRAM_SPRITE:   handle_draw_vram_sprite(payload, len);       return;
         case OP_RENDER_TEXT:        handle_render_text(payload, len);            return;

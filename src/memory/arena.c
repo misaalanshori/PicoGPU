@@ -6,8 +6,8 @@
 #include "feature_flags.h"
 #include <string.h>
 
-// 480 KB backing store — aligned to 16 bytes for DMA safety.
-// Placed in BSS so it is zero-initialized on cold boot.
+// Arena backing store — ARENA_MAX_BYTES = TOTAL_SRAM - ARENA_OVERHEAD.
+// Aligned to 16 bytes for DMA safety. Placed in BSS (zero-initialized on cold boot).
 static uint8_t __attribute__((aligned(16))) _arena_backing[ARENA_MAX_BYTES];
 
 uint8_t  *g_arena_base     = _arena_backing;

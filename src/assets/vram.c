@@ -57,33 +57,58 @@ void handle_upload_vram(const uint8_t *payload, uint32_t len)
 
     uint8_t rle_flag = payload[8];
 
-    // RLE deferred to Phase 3
-    if (rle_flag != 0u) {
-        coprocessor_set_error(ERR_INVALID_PARAM);
-        return;
-    }
-
     // Validate VRAM pointer initialised
     if (g_vram == NULL) {
         coprocessor_set_error(ERR_INVALID_PARAM);
         return;
     }
 
-    // Bounds check
+    // Bounds check: decoded region must fit in VRAM
     if ((offset + count) > g_vram_size) {
         coprocessor_set_error(ERR_VRAM_FULL);
         return;
     }
 
-    // Validate that the payload contains enough pixel data
+    const uint8_t *src_data = payload + UPLOAD_HEADER_SIZE;
     uint32_t data_available = len - UPLOAD_HEADER_SIZE;
-    if (data_available < count) {
-        coprocessor_set_error(ERR_INVALID_PARAM);
-        return;
-    }
 
-    // Copy pixel data into VRAM
-    memcpy(g_vram + offset, payload + UPLOAD_HEADER_SIZE, count);
+    if (rle_flag == 0u) {
+        // Raw copy
+        if (data_available < count) {
+            coprocessor_set_error(ERR_INVALID_PARAM);
+            return;
+        }
+        memcpy(g_vram + offset, src_data, count);
+    } else {
+        // H4 fix: RLE decode into VRAM (same format as blit.c §5.7)
+        // Format: run-mode   [count:1B][byte:1B] → count copies of byte
+        //         literal     [0x00:1B][n:1B][n raw bytes]
+        uint32_t src_pos  = 0;
+        uint32_t dst_pos  = 0;
+        while (dst_pos < count && src_pos < data_available) {
+            uint8_t token = src_data[src_pos++];
+            if (token == 0x00u) {
+                // Literal run
+                if (src_pos >= data_available) break;
+                uint8_t n = src_data[src_pos++];
+                for (uint8_t i = 0; i < n && dst_pos < count && src_pos < data_available; i++) {
+                    g_vram[offset + dst_pos++] = src_data[src_pos++];
+                }
+            } else {
+                // Repeat run
+                if (src_pos >= data_available) break;
+                uint8_t color = src_data[src_pos++];
+                for (uint8_t i = 0; i < token && dst_pos < count; i++) {
+                    g_vram[offset + dst_pos++] = color;
+                }
+            }
+        }
+        if (dst_pos < count) {
+            // RLE stream underrun — partial write
+            coprocessor_set_error(ERR_INVALID_PARAM);
+            return;
+        }
+    }
 
     // Update high-water mark
     uint32_t new_hwm = offset + count;

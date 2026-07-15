@@ -19,6 +19,8 @@
 #if FEATURE_DISPLAY_LIST
   #include "../assets/display_list.h"
 #endif
+#include "../graphics/scissor.h"
+#include "../protocol/packets.h"
 
 // =============================================================================
 // Deferred queue globals (exposed via profiles.h)
@@ -193,17 +195,31 @@ void handle_system_config(const uint8_t *payload, uint16_t len) {
     spi_set_busy(true);
     g_state.state = GPU_STATE_INITIALIZING;
 
-    // Apply profile: PLL retune + DVI mode switch + start output
-    display_rp2350_apply_profile(prof);
+    // 1. Stop video output immediately (before touching any FB pointers)
+    display_rp2350_stop();
 
-    // Reset arena and re-allocate all regions
+    // 2. Reset arena and re-allocate all regions BEFORE restarting video,
+    //    so the scanline callback always sees valid framebuffer pointers.
+    //    (Spec §3.5: arena repartition → then video restart.)
     arena_reset();
 
     uint32_t fb_align = 4;
     g_fb_back = arena_alloc(prof->fb_size_bytes, fb_align);
+    if (!g_fb_back) {
+        coprocessor_set_error(ERR_OUT_OF_MEMORY);
+        spi_set_busy(false);
+        g_state.state = GPU_STATE_UNINITIALIZED;
+        return;
+    }
 
     if (prof->buffering == BUFFERING_DOUBLE) {
         g_fb_front = arena_alloc(prof->fb_size_bytes, fb_align);
+        if (!g_fb_front) {
+            coprocessor_set_error(ERR_OUT_OF_MEMORY);
+            spi_set_busy(false);
+            g_state.state = GPU_STATE_UNINITIALIZED;
+            return;
+        }
     } else {
         g_fb_front = g_fb_back;
     }
@@ -218,12 +234,21 @@ void handle_system_config(const uint8_t *payload, uint16_t len) {
     // Allocate VRAM sprite cache
     uint32_t sprite_bytes = reserve_vm ? prof->sprite_vm_on : prof->sprite_vm_off;
     uint8_t *vram_ptr     = arena_alloc(sprite_bytes, 4);
+    if (!vram_ptr && sprite_bytes > 0) {
+        coprocessor_set_error(ERR_OUT_OF_MEMORY);
+        spi_set_busy(false);
+        g_state.state = GPU_STATE_UNINITIALIZED;
+        return;
+    }
     vram_init(vram_ptr, sprite_bytes);
 
     // Reserve VM heap
     if (reserve_vm && prof->vm_heap_bytes > 0) {
         arena_alloc(prof->vm_heap_bytes, 4); // reserved, Phase 4+
     }
+
+    // 3. Now restart video with correct FB pointers in place
+    display_rp2350_apply_profile(prof);
 
 #if FEATURE_DEFERRED_DRAW
     // Allocate deferred draw queue for single-deferred profiles
@@ -281,5 +306,9 @@ void handle_soft_reset(void) {
 #if FEATURE_DISPLAY_LIST
     display_list_reset();
 #endif
+    // H1 fix: reset scissor stack (spec §4.1 requires RESET to clear clip state)
+    scissor_init();
+    // H6 fix: reset protocol parser (abandon any partially-received packet)
+    packets_init();
     coprocessor_state_init();
 }

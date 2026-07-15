@@ -2,6 +2,22 @@
 // 64-entry FNV-1a hash → VRAM byte offset table.
 // 512 bytes of static SRAM outside the arena.
 // Cleared on every SYSTEM_CONFIG profile switch and SOFT_RESET.
+//
+// DESIGN NOTE (M2 — KNOWN LIMITATION):
+// Named-VRAM allocation uses g_vram_used as a bump pointer (assigned_offset =
+// g_vram_used; g_vram_used += count). This is the SAME g_vram_used that
+// vram.c advances when UPLOAD_VRAM is sent at a host-chosen raw offset.
+// Mixing both strategies risks overlap:
+//   - Named alloc advances g_vram_used forward.
+//   - UPLOAD_VRAM at a host-picked offset < g_vram_used overwrites existing data.
+//   - UPLOAD_VRAM at offset > g_vram_used does NOT advance g_vram_used to that
+//     position, so named alloc may later hand out the same region.
+// The safe usage contract is: use EITHER named allocation OR raw UPLOAD_VRAM
+// for a given VRAM region, not both interchangeably within the same profile.
+// Additionally, handle_vram_free_named() only marks the table slot free but
+// does NOT reclaim the VRAM bytes (g_vram_used is never decremented). Repeated
+// alloc/free cycles will monotonically consume VRAM until exhaustion. A
+// compacting allocator or a per-allocation free-list would be needed to fix this.
 
 #include "vram_named.h"
 #include "vram.h"
@@ -122,6 +138,8 @@ void handle_vram_free_named(const uint8_t *payload, uint16_t len) {
     uint32_t hash = (uint32_t)payload[0]|((uint32_t)payload[1]<<8)|((uint32_t)payload[2]<<16)|((uint32_t)payload[3]<<24);
     for (uint32_t i = 0; i < NAMED_VRAM_SLOTS; i++) {
         if (s_named_slots[i].in_use && s_named_slots[i].hash == hash) {
+            // NOTE (M2): slot entry is freed but VRAM bytes are NOT reclaimed.
+            // g_vram_used is not decremented. See file-level comment above.
             s_named_slots[i].in_use = false;
             coprocessor_set_error(ERR_OK);
             return;

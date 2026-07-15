@@ -91,24 +91,37 @@
 #define GPU_PRIM_FLOOD_FILL          0x14u
 
 // =============================================================================
-// Error codes (spec §5.4)
+// Error codes — CANONICAL TABLE (spec §5.4)
+// Numeric values must exactly match the firmware's include/error_codes.h.
 // =============================================================================
 #define GPU_ERR_OK                  0x00u
 #define GPU_ERR_UNKNOWN_OPCODE      0x01u
-#define GPU_ERR_INVALID_PARAM       0x02u
-#define GPU_ERR_NOT_ACTIVE          0x03u
-#define GPU_ERR_UNSUPPORTED_PROFILE 0x04u
-#define GPU_ERR_VRAM_FULL           0x05u
-#define GPU_ERR_CRC_MISMATCH        0x06u
-#define GPU_ERR_FEATURE_UNAVAILABLE 0x07u
-#define GPU_ERR_VM_UNAVAILABLE      0x08u
-#define GPU_ERR_OVERFLOW            0x09u
-#define GPU_ERR_PAYLOAD_TOO_LARGE   0x0Au
-#define GPU_ERR_VRAM_NAME_NOT_FOUND 0x0Bu  // VRAM_LOOKUP: hash not in table
-#define GPU_ERR_VRAM_NAME_TABLE_FULL 0x0Cu // VRAM_ALLOC_NAMED: all 64 slots used
-#define GPU_ERR_DISPLAY_LIST_FULL   0x0Du  // recording exceeded max_bytes
-#define GPU_ERR_UNSUPPORTED         0x0Eu  // SET_PIXEL_FORMAT rejected by HAL
+#define GPU_ERR_CRC_MISMATCH        0x02u
+#define GPU_ERR_INVALID_PARAM       0x03u
+#define GPU_ERR_VRAM_FULL           0x04u
+#define GPU_ERR_NOT_INITIALIZED     0x05u
+#define GPU_ERR_VM_UNAVAILABLE      0x06u
+#define GPU_ERR_OUT_OF_MEMORY       0x07u
+#define GPU_ERR_FEATURE_UNAVAILABLE 0x08u
+#define GPU_ERR_CLIP_STACK_OVERFLOW  0x09u
+#define GPU_ERR_CLIP_STACK_UNDERFLOW 0x0Au
+#define GPU_ERR_VRAM_NOT_FOUND      0x0Bu
+#define GPU_ERR_DISPLAY_LIST_ACTIVE 0x0Cu
+#define GPU_ERR_NO_DISPLAY_LIST     0x0Du
+#define GPU_ERR_VM_FAULT            0x0Eu
+#define GPU_ERR_BUSY                0x0Fu
+#define GPU_ERR_FRAME_NOT_OPEN      0x10u
 #define GPU_ERR_INTERNAL            0xFFu
+
+// Semantic aliases for common host-SDK call sites
+#define GPU_ERR_NOT_ACTIVE          GPU_ERR_NOT_INITIALIZED
+#define GPU_ERR_UNSUPPORTED_PROFILE GPU_ERR_INVALID_PARAM
+#define GPU_ERR_PAYLOAD_TOO_LARGE   GPU_ERR_INVALID_PARAM
+#define GPU_ERR_OVERFLOW            GPU_ERR_OUT_OF_MEMORY
+#define GPU_ERR_VRAM_NAME_NOT_FOUND GPU_ERR_VRAM_NOT_FOUND
+#define GPU_ERR_VRAM_NAME_TABLE_FULL GPU_ERR_OUT_OF_MEMORY
+#define GPU_ERR_DISPLAY_LIST_FULL   GPU_ERR_OUT_OF_MEMORY
+#define GPU_ERR_UNSUPPORTED         GPU_ERR_FEATURE_UNAVAILABLE
 
 // =============================================================================
 // Protocol constants

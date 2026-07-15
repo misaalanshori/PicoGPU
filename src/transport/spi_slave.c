@@ -20,6 +20,19 @@
 // from PIN_SCK so this is safe even if feature_flags.h changes the pin.
 // WAIT 1 GPIO template: 0x2080 | (pin & 0x1F)
 // WAIT 0 GPIO template: 0x2000 | (pin & 0x1F)
+//
+// KNOWN LIMITATION (C5): This PIO program has no CS-gating logic.
+// A standard SPI slave implementation gates shifting on CS=LOW and resets
+// on CS=HIGH (deassert). This implementation runs the WAIT/IN loop
+// unconditionally, which means:
+//   a) Dummy clocks the host generates during MISO readback (query responses)
+//      are sampled as new command bytes — because MOSI still toggles during
+//      those clocks and SCK is pulsed.
+//   b) If CS is deasserted mid-byte, there is no way to flush the partial
+//      byte from the ISR or reset the bit-boundary for the next transaction.
+// Fixing this requires adding CS-based WAIT+JMP instructions (at least 2
+// more PIO words). The packet parser's CRC check + 0xAA sync scan partially
+// compensates for case (a) in practice, but it is not a full solution.
 // ---------------------------------------------------------------------------
 static uint16_t spi_slave_program_instructions[3];  // filled by _spi_slave_pio_init
 
@@ -136,6 +149,15 @@ void spi_slave_init(void)
     gpio_put(PIN_MISO, 0);
 
     // DC   (GP4): input
+    // KNOWN LIMITATION (C4): PIN_DC is configured as a GPIO input here but is
+    // never read by the firmware. The spec (§4.1, §5.1, NFR #5) specifies that
+    // D/C provides hardware packet-boundary context so the parser can recover
+    // from a single dropped/corrupted byte without permanent desynchronisation.
+    // Implementing this correctly requires: (1) routing PIN_DC as a PIO
+    // jmp-pin so the state machine resets on D/C edges, and (2) using D/C
+    // transitions in packets.c as a hard parser-reset signal rather than
+    // relying solely on the 0xAA sync-byte scan. Without this, NFR #5 is
+    // met only weakly (0xAA scan + CRC rejection, not hardware packet framing).
     gpio_init(PIN_DC);
     gpio_set_dir(PIN_DC, GPIO_IN);
 
@@ -148,10 +170,13 @@ void spi_slave_init(void)
     gpio_init(PIN_TE);
     gpio_set_dir(PIN_TE, GPIO_IN);
 
-    // RESET (GP7): output, hold HIGH (active-low reset)
+    // RESET (GP7): Host→Coprocessor input. Configure as input with pull-up.
+    // C6 fix: do NOT drive this as GPIO_OUT even momentarily — the host may
+    // already be holding the line, causing bus contention. main.c will attach
+    // the falling-edge IRQ after spi_slave_init() returns.
     gpio_init(PIN_RESET);
-    gpio_set_dir(PIN_RESET, GPIO_OUT);
-    gpio_put(PIN_RESET, 1);
+    gpio_set_dir(PIN_RESET, GPIO_IN);
+    gpio_pull_up(PIN_RESET);
 
     // PIO and DMA
     _spi_slave_pio_init();

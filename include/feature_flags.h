@@ -167,9 +167,9 @@
 // =============================================================================
 // Arena Sizing
 // =============================================================================
-#define ARENA_OVERHEAD_BYTES (160u * 1024u)  // 160 KB: USB stack + pico_hdmi bufs + stacks
-#define TOTAL_SRAM_BYTES     (520u * 1024u)  // RP2350 (SRAM0-5)
-#define ARENA_MAX_BYTES      (TOTAL_SRAM_BYTES - ARENA_OVERHEAD_BYTES)  // 360 KB
+#define ARENA_OVERHEAD_BYTES (80u * 1024u)   // 80 KB: USB stack + pico_hdmi + stacks + other BSS
+#define TOTAL_SRAM_BYTES     (520u * 1024u)   // RP2350 (SRAM0-5)
+#define ARENA_MAX_BYTES      (TOTAL_SRAM_BYTES - ARENA_OVERHEAD_BYTES)  // 440 KB available
 
 // =============================================================================
 // Tuning Constants

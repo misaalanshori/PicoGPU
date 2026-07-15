@@ -145,9 +145,9 @@ uint32_t packets_process(void)
             g_parser.running_crc  = crc16_update(g_parser.running_crc, byte);
             g_parser.payload_idx  = 0;
 
-            // Reject oversized payloads immediately — host must chunk.
+            // M3 fix: use ERR_PAYLOAD_TOO_LARGE (spec §5.4) for transport-level oversize
             if (g_parser.payload_len > MAX_PAYLOAD_SIZE) {
-                coprocessor_set_error(ERR_INVALID_PARAM);
+                coprocessor_set_error(ERR_PAYLOAD_TOO_LARGE);
                 _reset_parser();
                 break;
             }

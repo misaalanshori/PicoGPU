@@ -11,12 +11,20 @@
 // EXEC_DISPLAY_LIST  (0x86): 1-byte payload: slot_id(1B)
 
 // 8-byte VRAM header written at vram_offset by END_DISPLAY_LIST:
+// [0..3] magic (DL_MAGIC)
+// [4]    slot_id
+// [5]    reserved (0)
+// [6..7] byte_count (uint16_t LE) — command bytes after the header
+// The header is followed immediately by the CRC16 of the command body,
+// stored as an in-band suffix after byte_count bytes of commands.
+// H5 fix: checksum replaces the unused _pad byte and is computed by END,
+//         verified by EXEC, using the same CRC16-CCITT as the SPI protocol.
 #define DL_MAGIC 0x444C4953u  // "DLIS" in LE
 typedef struct {
     uint32_t magic;       // DL_MAGIC
     uint8_t  slot_id;
-    uint8_t  _pad;
-    uint16_t byte_count;  // command bytes after the header
+    uint8_t  checksum_lo; // CRC16-CCITT low byte of command body
+    uint16_t byte_count;  // command bytes after the header (max 65535)
 } dl_header_t;
 
 // Handlers
